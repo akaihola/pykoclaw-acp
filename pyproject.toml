@@ -1,0 +1,20 @@
+[project]
+name = "pykoclaw-acp"
+version = "0.1.0"
+description = "ACP (Agent Client Protocol) plugin for pykoclaw"
+requires-python = ">=3.12"
+dependencies = ["pykoclaw", "pykoclaw-messaging", "click"]
+
+[tool.uv.sources]
+pykoclaw = { workspace = true }
+pykoclaw-messaging = { workspace = true }
+
+[project.entry-points."pykoclaw.plugins"]
+acp = "pykoclaw_acp:AcpPlugin"
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio"]
+
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10.0"]
+build-backend = "uv_build"
