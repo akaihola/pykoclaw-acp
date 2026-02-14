@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import Any
 
 from pykoclaw.db import DbConnection
-from pykoclaw_messaging import dispatch_to_agent
 
+from .client_pool import ClientPool
 from .protocol import AcpProtocolHandler, JsonRpcError
 
 log = logging.getLogger(__name__)
@@ -25,10 +25,12 @@ class AcpServer:
         self._data_dir = data_dir
         self._protocol = AcpProtocolHandler()
         self._sessions: dict[str, dict[str, Any]] = {}
+        self._pool = ClientPool(db=db, data_dir=data_dir)
         self._running = False
 
     async def run(self) -> None:
         self._running = True
+        await self._pool.start()
         log.info("Starting ACP channel (JSON-RPC over stdio)")
 
         loop = asyncio.get_event_loop()
@@ -66,6 +68,7 @@ class AcpServer:
 
     async def stop(self) -> None:
         self._running = False
+        await self._pool.close()
         self._sessions.clear()
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
@@ -155,14 +158,7 @@ class AcpServer:
             )
 
         try:
-            await dispatch_to_agent(
-                prompt=content,
-                channel_prefix="acp",
-                channel_id=session_id[:8],
-                db=self._db,
-                data_dir=self._data_dir,
-                on_text=_send_chunk,
-            )
+            await self._pool.send(session_id, content, on_text=_send_chunk)
         except Exception:
             log.exception("Agent dispatch failed for session %s", session_id)
             self._write(
