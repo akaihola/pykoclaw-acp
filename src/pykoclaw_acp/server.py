@@ -9,7 +9,12 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from pykoclaw.db import DbConnection
+from pykoclaw.db import (
+    DbConnection,
+    get_pending_deliveries,
+    mark_delivered,
+    mark_delivery_failed,
+)
 
 from .client_pool import ClientPool
 from .protocol import AcpProtocolHandler, JsonRpcError
@@ -17,6 +22,7 @@ from .protocol import AcpProtocolHandler, JsonRpcError
 log = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
+DELIVERY_POLL_INTERVAL_S = 10
 
 
 class AcpServer:
@@ -31,6 +37,7 @@ class AcpServer:
     async def run(self) -> None:
         self._running = True
         await self._pool.start()
+        self._delivery_task = asyncio.create_task(self._delivery_poll_loop())
         log.info("Starting ACP channel (JSON-RPC over stdio)")
 
         loop = asyncio.get_event_loop()
@@ -68,6 +75,8 @@ class AcpServer:
 
     async def stop(self) -> None:
         self._running = False
+        if hasattr(self, "_delivery_task"):
+            self._delivery_task.cancel()
         await self._pool.close()
         self._sessions.clear()
 
@@ -177,6 +186,63 @@ class AcpServer:
         # Send prompt response AFTER streaming completes, per ACP protocol.
         # The stopReason tells the client the turn is finished.
         self._write(self._protocol.format_response(msg_id, {"stopReason": "end_turn"}))
+
+    async def _delivery_poll_loop(self) -> None:
+        log.info("ACP delivery polling started")
+        try:
+            while self._running:
+                await asyncio.sleep(DELIVERY_POLL_INTERVAL_S)
+                try:
+                    self._process_pending_deliveries()
+                except Exception:
+                    log.exception("Error processing ACP delivery queue")
+        except asyncio.CancelledError:
+            log.info("ACP delivery polling stopped")
+
+    def _process_pending_deliveries(self) -> None:
+        pending = get_pending_deliveries(self._db, "acp")
+        if not pending:
+            return
+
+        active_conversations = {
+            entry.conversation_name for entry in self._pool._entries.values()
+        }
+
+        for delivery in pending:
+            if delivery.conversation not in active_conversations:
+                continue
+
+            session_id = self._find_session_for_conversation(delivery.conversation)
+            if not session_id:
+                continue
+
+            try:
+                self._write(
+                    self._protocol.format_notification(
+                        "session/update",
+                        {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {
+                                    "type": "text",
+                                    "text": delivery.message,
+                                },
+                            },
+                        },
+                    )
+                )
+                mark_delivered(self._db, delivery.id)
+                log.info("Delivered task result to ACP session %s", session_id)
+            except Exception:
+                mark_delivery_failed(self._db, delivery.id, "write failed")
+                log.exception("Failed to deliver to ACP session %s", session_id)
+
+    def _find_session_for_conversation(self, conversation: str) -> str | None:
+        for session_id, entry in self._pool._entries.items():
+            if entry.conversation_name == conversation:
+                return session_id
+        return None
 
     def _write(self, message: str) -> None:
         try:
