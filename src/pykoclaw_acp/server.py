@@ -60,7 +60,7 @@ class AcpServer:
 
             except Exception:
                 log.exception("Error reading stdin")
-                break
+                continue
 
         self._running = False
 
@@ -157,14 +157,29 @@ class AcpServer:
                 )
             )
 
-        await dispatch_to_agent(
-            prompt=content,
-            channel_prefix="acp",
-            channel_id=session_id[:8],
-            db=self._db,
-            data_dir=self._data_dir,
-            on_text=_send_chunk,
-        )
+        try:
+            await dispatch_to_agent(
+                prompt=content,
+                channel_prefix="acp",
+                channel_id=session_id[:8],
+                db=self._db,
+                data_dir=self._data_dir,
+                on_text=_send_chunk,
+            )
+        except Exception:
+            log.exception("Agent dispatch failed for session %s", session_id)
+            self._write(
+                self._protocol.format_notification(
+                    "session/update",
+                    {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "error",
+                            "error": "Agent processing failed. Please try again.",
+                        },
+                    },
+                )
+            )
 
     def _write(self, message: str) -> None:
         try:
