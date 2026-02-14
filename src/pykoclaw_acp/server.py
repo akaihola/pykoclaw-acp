@@ -140,9 +140,6 @@ class AcpServer:
             )
             return
 
-        # Acknowledge immediately.
-        self._write(self._protocol.format_response(msg_id, {}))
-
         async def _send_chunk(text: str) -> None:
             self._write(
                 self._protocol.format_notification(
@@ -180,6 +177,10 @@ class AcpServer:
                     },
                 )
             )
+
+        # Send prompt response AFTER streaming completes, per ACP protocol.
+        # The stopReason tells the client the turn is finished.
+        self._write(self._protocol.format_response(msg_id, {"stopReason": "end_turn"}))
 
     def _write(self, message: str) -> None:
         try:
