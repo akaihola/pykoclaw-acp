@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from pathlib import Path
@@ -162,3 +163,136 @@ async def test_response_without_method_is_ignored(server: AcpServer) -> None:
     written = _collect_writes(server)
     await server._dispatch({"jsonrpc": "2.0", "id": 1, "result": {"ok": True}})
     assert len(written) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_prompt_dispatch_error_sends_notification(
+    server: AcpServer,
+) -> None:
+    written = _collect_writes(server)
+
+    await server._dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}}
+    )
+    session_id = written[0]["result"]["sessionId"]
+
+    mock_dispatch = AsyncMock(side_effect=RuntimeError("API timeout"))
+
+    with patch("pykoclaw_acp.server.dispatch_to_agent", mock_dispatch):
+        await server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "hello"}],
+                },
+            }
+        )
+
+    ack = written[1]
+    assert ack["id"] == 2
+    assert ack["result"] == {}
+
+    error_notif = written[2]
+    assert error_notif["method"] == "session/update"
+    assert error_notif["params"]["sessionId"] == session_id
+    assert error_notif["params"]["update"]["sessionUpdate"] == "error"
+    assert "error" in error_notif["params"]["update"]
+
+
+@pytest.mark.asyncio
+async def test_session_prompt_dispatch_error_server_survives(
+    server: AcpServer,
+) -> None:
+    written = _collect_writes(server)
+
+    await server._dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}}
+    )
+    session_id = written[0]["result"]["sessionId"]
+
+    mock_dispatch = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with patch("pykoclaw_acp.server.dispatch_to_agent", mock_dispatch):
+        await server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "hello"}],
+                },
+            }
+        )
+
+    await server._dispatch(
+        {"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}}
+    )
+
+    init_response = written[-1]
+    assert init_response["id"] == 3
+    assert "result" in init_response
+    assert init_response["result"]["protocolVersion"] == 1
+
+
+@pytest.mark.asyncio
+async def test_main_loop_continues_after_dispatch_error(
+    server: AcpServer,
+) -> None:
+    written = _collect_writes(server)
+
+    original_dispatch = server._dispatch
+    call_count = 0
+
+    async def mock_dispatch_with_error(msg: dict[str, Any]) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("transient error")
+        await original_dispatch(msg)
+
+    server._dispatch = mock_dispatch_with_error  # type: ignore[assignment]
+
+    try:
+        await server._dispatch({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+    except RuntimeError:
+        pass
+
+    await server._dispatch(
+        {"jsonrpc": "2.0", "id": 2, "method": "initialize", "params": {}}
+    )
+
+    init_response = written[-1]
+    assert init_response["id"] == 2
+    assert "result" in init_response
+
+
+@pytest.mark.asyncio
+async def test_dispatch_error_does_not_catch_cancelled_error(
+    server: AcpServer,
+) -> None:
+    written = _collect_writes(server)
+
+    await server._dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}}
+    )
+    session_id = written[0]["result"]["sessionId"]
+
+    mock_dispatch = AsyncMock(side_effect=asyncio.CancelledError())
+
+    with patch("pykoclaw_acp.server.dispatch_to_agent", mock_dispatch):
+        with pytest.raises(asyncio.CancelledError):
+            await server._dispatch(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "session/prompt",
+                    "params": {
+                        "sessionId": session_id,
+                        "prompt": [{"type": "text", "text": "hello"}],
+                    },
+                }
+            )
