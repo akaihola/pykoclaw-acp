@@ -163,6 +163,14 @@ Two user-editable `CLAUDE.md` files control the agent's behavior:
 The agent has access to standard tools (Bash, file I/O, web search) and the
 built-in pykoclaw MCP tools (task scheduling).
 
+## Delivery queue
+
+When the pykoclaw scheduler runs a scheduled task, results are written to a
+`delivery_queue` table in SQLite. The ACP plugin polls this queue every 10
+seconds for items with channel prefix `acp`. If the originating session is still
+connected, results are pushed as `session/update` notifications. If the session
+has disconnected, deliveries remain pending until the client reconnects.
+
 ## Protocol reference
 
 The server implements three JSON-RPC methods:
