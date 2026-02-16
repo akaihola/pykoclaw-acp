@@ -25,6 +25,7 @@ log = logging.getLogger(__name__)
 
 IDLE_TIMEOUT_S = 600
 SWEEP_INTERVAL_S = 60
+QUERY_TIMEOUT_S = 600  # 10 min max per query to prevent infinite hangs
 
 _ALLOWED_TOOLS = [
     "Bash",
@@ -101,20 +102,23 @@ class ClientPool:
         prompt: str,
         on_text: Callable[[str], Awaitable[None]] | None,
     ) -> str | None:
-        await entry.client.query(prompt)
-        session_id: str | None = None
-        async for message in entry.client.receive_response():
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock) and on_text:
-                        await on_text(block.text)
-            elif isinstance(message, ResultMessage):
-                session_id = message.session_id
-                conv_dir = self._data_dir / "conversations" / entry.conversation_name
-                upsert_conversation(
-                    self._db, entry.conversation_name, session_id, str(conv_dir)
-                )
-        return session_id
+        async with asyncio.timeout(QUERY_TIMEOUT_S):
+            await entry.client.query(prompt)
+            session_id: str | None = None
+            async for message in entry.client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and on_text:
+                            await on_text(block.text)
+                elif isinstance(message, ResultMessage):
+                    session_id = message.session_id
+                    conv_dir = (
+                        self._data_dir / "conversations" / entry.conversation_name
+                    )
+                    upsert_conversation(
+                        self._db, entry.conversation_name, session_id, str(conv_dir)
+                    )
+            return session_id
 
     async def _get_or_create(self, session_id: str) -> _Entry:
         if session_id in self._entries:
@@ -133,8 +137,10 @@ class ClientPool:
                 permission_mode="bypassPermissions",
                 mcp_servers={"pykoclaw": make_mcp_server(self._db, conversation_name)},
                 model=settings.model,
+                cli_path=settings.cli_path,
                 allowed_tools=list(_ALLOWED_TOOLS),
                 setting_sources=["project"],
+                env={"SHELL": "/bin/bash"},
             )
 
             client = ClaudeSDKClient(options)

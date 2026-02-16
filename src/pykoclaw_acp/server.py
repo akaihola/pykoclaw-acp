@@ -18,32 +18,47 @@ from pykoclaw.db import (
 
 from .client_pool import ClientPool
 from .protocol import AcpProtocolHandler, JsonRpcError
+from .watchdog import Watchdog
 
 log = logging.getLogger(__name__)
 
 PROTOCOL_VERSION = 1
 DELIVERY_POLL_INTERVAL_S = 10
+HEARTBEAT_INTERVAL_S = 5
 
 
 class AcpServer:
-    def __init__(self, *, db: DbConnection, data_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        db: DbConnection,
+        data_dir: Path,
+        watchdog: Watchdog | None = None,
+    ) -> None:
         self._db = db
         self._data_dir = data_dir
         self._protocol = AcpProtocolHandler()
         self._sessions: dict[str, dict[str, Any]] = {}
         self._pool = ClientPool(db=db, data_dir=data_dir)
         self._running = False
+        self._watchdog = watchdog
 
     async def run(self) -> None:
         self._running = True
         await self._pool.start()
         self._delivery_task = asyncio.create_task(self._delivery_poll_loop())
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        if self._watchdog:
+            self._watchdog.start()
         log.info("Starting ACP channel (JSON-RPC over stdio)")
 
         loop = asyncio.get_event_loop()
         reader = asyncio.StreamReader()
         protocol = asyncio.StreamReaderProtocol(reader)
         await loop.connect_read_pipe(lambda: protocol, sys.stdin)
+
+        consecutive_errors = 0
+        max_consecutive_errors = 10
 
         while self._running:
             try:
@@ -54,7 +69,10 @@ class AcpServer:
 
                 line_str = line.decode("utf-8").strip()
                 if not line_str:
+                    await asyncio.sleep(0.001)  # prevent busy-loop on empty lines
                     continue
+
+                consecutive_errors = 0  # successful read resets counter
 
                 msg = self._protocol.parse_message(line_str)
                 if msg is None:
@@ -68,17 +86,40 @@ class AcpServer:
                 await self._dispatch(msg)
 
             except Exception:
-                log.exception("Error reading stdin")
+                consecutive_errors += 1
+                log.exception(
+                    "Error reading stdin (consecutive: %d/%d)",
+                    consecutive_errors,
+                    max_consecutive_errors,
+                )
+                if consecutive_errors >= max_consecutive_errors:
+                    log.error("Too many consecutive errors, stopping ACP server")
+                    break
+                await asyncio.sleep(0.1)  # back off on errors
                 continue
 
         self._running = False
 
     async def stop(self) -> None:
         self._running = False
+        if self._watchdog:
+            self._watchdog.stop()
         if hasattr(self, "_delivery_task"):
             self._delivery_task.cancel()
+        if hasattr(self, "_heartbeat_task"):
+            self._heartbeat_task.cancel()
         await self._pool.close()
         self._sessions.clear()
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodically ping the watchdog to prove the event loop is alive."""
+        try:
+            while self._running:
+                if self._watchdog:
+                    self._watchdog.heartbeat()
+                await asyncio.sleep(HEARTBEAT_INTERVAL_S)
+        except asyncio.CancelledError:
+            pass
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
         method = msg.get("method")
