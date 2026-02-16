@@ -1,0 +1,13 @@
+{
+  "name": "pykoclaw-acp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:ui": "playwright test",
+    "test:ui:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.50.1"
+  }
+}
