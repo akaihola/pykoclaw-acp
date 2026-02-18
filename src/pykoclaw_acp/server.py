@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -101,15 +102,19 @@ class AcpServer:
         self._running = False
 
     async def stop(self) -> None:
+        log.info("AcpServer.stop() — %d active sessions", len(self._sessions))
         self._running = False
         if self._watchdog:
             self._watchdog.stop()
+            log.info("Watchdog stopped")
         if hasattr(self, "_delivery_task"):
             self._delivery_task.cancel()
         if hasattr(self, "_heartbeat_task"):
             self._heartbeat_task.cancel()
+        log.info("Closing client pool (%d entries)", len(self._pool._entries))
         await self._pool.close()
         self._sessions.clear()
+        log.info("AcpServer.stop() complete")
 
     async def _heartbeat_loop(self) -> None:
         """Periodically ping the watchdog to prove the event loop is alive."""
@@ -136,6 +141,7 @@ class AcpServer:
         }.get(method)
 
         if handler is None:
+            log.warning("Method not found: %s (id=%s)", method, msg_id)
             self._write(
                 self._protocol.format_error(
                     msg_id,
@@ -145,7 +151,11 @@ class AcpServer:
             )
             return
 
+        t0 = time.monotonic()
+        log.debug("→ %s id=%s", method, msg_id)
         await handler(msg_id, params)
+        elapsed = time.monotonic() - t0
+        log.debug("← %s id=%s %.3fs", method, msg_id, elapsed)
 
     async def _handle_initialize(self, msg_id: Any, params: dict[str, Any]) -> None:
         result = {

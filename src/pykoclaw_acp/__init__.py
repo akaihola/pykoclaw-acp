@@ -38,15 +38,20 @@ def _run_server(server: object) -> None:
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    log.info("ACP server starting (PID %d)", os.getpid())
     try:
         loop.run_until_complete(server.run())  # type: ignore[attr-defined]
     except KeyboardInterrupt:
-        pass
+        log.info("SHUTDOWN: KeyboardInterrupt received")
     finally:
+        log.info("SHUTDOWN: stopping server (graceful cleanup)")
         loop.run_until_complete(server.stop())  # type: ignore[attr-defined]
+        log.info("SHUTDOWN: server stopped, cancelling remaining tasks")
         _cancel_remaining_tasks(loop)
+        log.info("SHUTDOWN: shutting down async generators")
         loop.run_until_complete(loop.shutdown_asyncgens())
         loop.close()
+        log.info("SHUTDOWN: event loop closed — clean exit")
 
 
 def _cancel_remaining_tasks(loop: asyncio.AbstractEventLoop) -> None:
@@ -188,7 +193,16 @@ class AcpPlugin(PykoClawPluginBase):
             is_flag=True,
             help="Send initialize request, verify response, and exit.",
         )
-        def acp(healthcheck: bool) -> None:
+        @click.option(
+            "--log-level",
+            type=click.Choice(
+                ["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False,
+            ),
+            default="INFO",
+            envvar="PYKOCLAW_ACP_LOG_LEVEL",
+            help="Logging level (default: INFO, env: PYKOCLAW_ACP_LOG_LEVEL).",
+        )
+        def acp(healthcheck: bool, log_level: str) -> None:
             """Start ACP server (JSON-RPC over stdio)."""
             if healthcheck:
                 from pykoclaw.config import settings
@@ -213,8 +227,9 @@ class AcpPlugin(PykoClawPluginBase):
 
             logging.basicConfig(
                 stream=sys.stderr,
-                level=logging.ERROR,
-                format="%(levelname)s %(name)s: %(message)s",
+                level=getattr(logging, log_level.upper()),
+                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
             )
 
             from pykoclaw.config import settings
