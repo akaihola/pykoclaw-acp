@@ -68,10 +68,17 @@ class ClientPool:
         if self._sweep_task:
             self._sweep_task.cancel()
             self._sweep_task = None
-        await asyncio.gather(
-            *(self._disconnect(sid) for sid in list(self._entries)),
+        sids = list(self._entries)
+        log.info("ClientPool.close() — disconnecting %d client(s)", len(sids))
+        results = await asyncio.gather(
+            *(self._disconnect(sid) for sid in sids),
             return_exceptions=True,
         )
+        errors = [(sid, r) for sid, r in zip(sids, results) if isinstance(r, Exception)]
+        if errors:
+            for sid, exc in errors:
+                log.warning("ClientPool: error disconnecting %s: %s", sid, exc)
+        log.info("ClientPool.close() complete")
 
     async def send(
         self,
