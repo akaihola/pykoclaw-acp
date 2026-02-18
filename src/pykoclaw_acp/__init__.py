@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import selectors
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import click
@@ -75,11 +79,124 @@ def _cancel_remaining_tasks(loop: asyncio.AbstractEventLoop) -> None:
         os._exit(0)
 
 
+_HEALTHCHECK_TIMEOUT_S = 10
+
+
+def _run_healthcheck(cli_path: str) -> None:
+    """Spawn ``pykoclaw acp`` and verify it responds to ``initialize``.
+
+    Exits with code 0 on success, 1 on failure.  Designed to be run after
+    a deploy to catch import errors, config problems, and protocol regressions
+    without needing a full Mitto session.
+    """
+    request = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {},
+    }) + "\n"
+
+    click.echo(f"Starting ACP server ({cli_path} acp) ...", err=True)
+    start = time.monotonic()
+
+    try:
+        proc = subprocess.Popen(
+            [cli_path, "acp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        click.echo(f"FAIL: command not found: {cli_path}", err=True)
+        sys.exit(1)
+
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        proc.stdin.write(request)
+        proc.stdin.flush()
+        proc.stdin.close()  # signal EOF so the server exits its read loop
+
+        # Read response with timeout
+        sel = selectors.DefaultSelector()
+        sel.register(proc.stdout, selectors.EVENT_READ)
+
+        response_line = ""
+        deadline = start + _HEALTHCHECK_TIMEOUT_S
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            events = sel.select(timeout=max(0, remaining))
+            if events:
+                chunk = proc.stdout.readline()
+                if chunk:
+                    response_line = chunk.strip()
+                    break
+                break  # EOF
+
+        sel.close()
+        elapsed = time.monotonic() - start
+
+        if not response_line:
+            stderr_out = proc.stderr.read() if proc.stderr else ""
+            click.echo(
+                f"FAIL: no response within {_HEALTHCHECK_TIMEOUT_S}s", err=True,
+            )
+            if stderr_out.strip():
+                click.echo(f"stderr: {stderr_out.strip()}", err=True)
+            sys.exit(1)
+
+        msg = json.loads(response_line)
+        result = msg.get("result", {})
+        agent_info = result.get("agentInfo", {})
+
+        if (
+            msg.get("jsonrpc") == "2.0"
+            and msg.get("id") == 1
+            and "protocolVersion" in result
+        ):
+            click.echo(
+                f"OK: {agent_info.get('name', '?')} v{agent_info.get('version', '?')}"
+                f" (protocol v{result['protocolVersion']})"
+                f" responded in {elapsed:.2f}s",
+                err=True,
+            )
+            sys.exit(0)
+        else:
+            click.echo(f"FAIL: unexpected response: {response_line}", err=True)
+            sys.exit(1)
+
+    except json.JSONDecodeError as exc:
+        click.echo(f"FAIL: invalid JSON response: {exc}", err=True)
+        sys.exit(1)
+    except Exception as exc:
+        click.echo(f"FAIL: {exc}", err=True)
+        sys.exit(1)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
 class AcpPlugin(PykoClawPluginBase):
     def register_commands(self, group: click.Group) -> None:
         @group.command()
-        def acp() -> None:
+        @click.option(
+            "--healthcheck",
+            is_flag=True,
+            help="Send initialize request, verify response, and exit.",
+        )
+        def acp(healthcheck: bool) -> None:
             """Start ACP server (JSON-RPC over stdio)."""
+            if healthcheck:
+                from pykoclaw.config import settings
+
+                cli_path = getattr(settings, "cli_path", None) or "pykoclaw"
+                _run_healthcheck(cli_path)
+                return
+
             import faulthandler
             import signal
 
