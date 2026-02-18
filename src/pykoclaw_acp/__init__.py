@@ -11,6 +11,44 @@ import click
 
 from pykoclaw.plugins import PykoClawPluginBase
 
+# Seconds to wait for tasks to cancel during shutdown before force-killing.
+_SHUTDOWN_TIMEOUT_S = 5
+
+
+async def _run_with_graceful_shutdown(server: object) -> None:
+    """Run the ACP server and enforce a bounded shutdown.
+
+    ``asyncio.run()`` calls ``_cancel_all_tasks()`` which waits *indefinitely*
+    for every task to finish cancellation.  If any task is stuck on a
+    non-cancellable I/O or lock, the whole process hangs (the exact bug the
+    watchdog was catching).
+
+    This helper does the same work as ``asyncio.run()`` but with a timeout on
+    the cancellation phase so the process always exits.
+    """
+    try:
+        await server.run()  # type: ignore[attr-defined]
+    finally:
+        await server.stop()  # type: ignore[attr-defined]
+
+        # Cancel remaining tasks with a bounded timeout.
+        loop = asyncio.get_event_loop()
+        tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
+        if tasks:
+            for t in tasks:
+                t.cancel()
+            results = await asyncio.wait(tasks, timeout=_SHUTDOWN_TIMEOUT_S)
+            # Log tasks that refused to cancel.
+            still_pending = results[1] if isinstance(results, tuple) else set()
+            if still_pending:
+                logging.getLogger(__name__).warning(
+                    "SHUTDOWN: %d task(s) did not cancel within %ds — "
+                    "abandoning them: %s",
+                    len(still_pending),
+                    _SHUTDOWN_TIMEOUT_S,
+                    [t.get_name() for t in still_pending],
+                )
+
 
 class AcpPlugin(PykoClawPluginBase):
     def register_commands(self, group: click.Group) -> None:
@@ -48,4 +86,4 @@ class AcpPlugin(PykoClawPluginBase):
             db = init_db(settings.db_path)
             server = AcpServer(db=db, data_dir=settings.data, watchdog=watchdog)
 
-            asyncio.run(server.run())
+            asyncio.run(_run_with_graceful_shutdown(server))
