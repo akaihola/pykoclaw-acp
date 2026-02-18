@@ -225,11 +225,36 @@ class AcpPlugin(PykoClawPluginBase):
             faulthandler.enable(file=fault_file, all_threads=True)
             faulthandler.register(signal.SIGUSR1, file=fault_file, all_threads=True)
 
+            effective_level = getattr(logging, log_level.upper())
+
+            # Log to stderr (visible when run directly or via mitto cli;
+            # captured in 8KB ring buffer by mitto web — only at DEBUG level).
+            stderr_handler = logging.StreamHandler(sys.stderr)
+            stderr_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                    datefmt="%H:%M:%S",
+                )
+            )
+
+            # Also log to a file — survives regardless of how Mitto handles
+            # stderr.  Rotated by PID so concurrent processes don't clobber.
+            log_file = fault_dir / f"acp-{os.getpid()}.log"
+            file_handler = logging.FileHandler(log_file, mode="w")
+            file_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s %(levelname)s %(name)s: %(message)s",
+                    datefmt="%Y-%m-%d %H:%M:%S",
+                )
+            )
+
             logging.basicConfig(
-                stream=sys.stderr,
-                level=getattr(logging, log_level.upper()),
-                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-                datefmt="%H:%M:%S",
+                level=effective_level,
+                handlers=[stderr_handler, file_handler],
+            )
+            log.info(
+                "Logging to stderr + %s (level=%s, PID=%d)",
+                log_file, log_level, os.getpid(),
             )
 
             from pykoclaw.config import settings
