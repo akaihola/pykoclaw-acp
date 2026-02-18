@@ -7,7 +7,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -121,7 +121,7 @@ async def test_session_prompt_empty_prompt(server: AcpServer) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_prompt_streams_via_dispatch(server: AcpServer) -> None:
+async def test_session_prompt_calls_pool_send(server: AcpServer) -> None:
     written = _collect_writes(server)
 
     await server._dispatch(
@@ -129,33 +129,30 @@ async def test_session_prompt_streams_via_dispatch(server: AcpServer) -> None:
     )
     session_id = written[0]["result"]["sessionId"]
 
-    mock_dispatch = AsyncMock()
-    mock_dispatch.return_value = None
+    server._pool.send = AsyncMock(return_value=None)
 
-    with patch("pykoclaw_acp.server.dispatch_to_agent", mock_dispatch):
-        await server._dispatch(
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": [{"type": "text", "text": "hello"}],
-                },
-            }
-        )
+    await server._dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "hello"}],
+            },
+        }
+    )
 
-    # ACP requires an empty acknowledgment before streaming begins
-    ack = written[1]
-    assert ack["id"] == 2
-    assert ack["result"] == {}
+    server._pool.send.assert_awaited_once()
+    call_args = server._pool.send.call_args
+    assert call_args[0][0] == session_id  # first positional: session_id
+    assert call_args[0][1] == "hello"  # second positional: content
+    assert call_args[1]["on_text"] is not None  # keyword: on_text callback
 
-    mock_dispatch.assert_awaited_once()
-    call_kwargs = mock_dispatch.call_args.kwargs
-    assert call_kwargs["prompt"] == "hello"
-    assert call_kwargs["channel_prefix"] == "acp"
-    assert call_kwargs["channel_id"] == session_id[:8]
-    assert call_kwargs["on_text"] is not None
+    # Final message is the stop response
+    stop = written[-1]
+    assert stop["id"] == 2
+    assert stop["result"]["stopReason"] == "end_turn"
 
 
 @pytest.mark.asyncio
@@ -166,7 +163,7 @@ async def test_response_without_method_is_ignored(server: AcpServer) -> None:
 
 
 @pytest.mark.asyncio
-async def test_session_prompt_dispatch_error_sends_notification(
+async def test_session_prompt_pool_error_sends_notification(
     server: AcpServer,
 ) -> None:
     written = _collect_writes(server)
@@ -176,34 +173,35 @@ async def test_session_prompt_dispatch_error_sends_notification(
     )
     session_id = written[0]["result"]["sessionId"]
 
-    mock_dispatch = AsyncMock(side_effect=RuntimeError("API timeout"))
+    server._pool.send = AsyncMock(side_effect=RuntimeError("API timeout"))
 
-    with patch("pykoclaw_acp.server.dispatch_to_agent", mock_dispatch):
-        await server._dispatch(
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": [{"type": "text", "text": "hello"}],
-                },
-            }
-        )
+    await server._dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "hello"}],
+            },
+        }
+    )
 
-    ack = written[1]
-    assert ack["id"] == 2
-    assert ack["result"] == {}
-
-    error_notif = written[2]
+    # Error notification should be sent
+    error_notif = written[1]
     assert error_notif["method"] == "session/update"
     assert error_notif["params"]["sessionId"] == session_id
     assert error_notif["params"]["update"]["sessionUpdate"] == "error"
     assert "error" in error_notif["params"]["update"]
 
+    # Stop response still sent even after error
+    stop = written[-1]
+    assert stop["id"] == 2
+    assert stop["result"]["stopReason"] == "end_turn"
+
 
 @pytest.mark.asyncio
-async def test_session_prompt_dispatch_error_server_survives(
+async def test_session_prompt_pool_error_server_survives(
     server: AcpServer,
 ) -> None:
     written = _collect_writes(server)
@@ -213,21 +211,21 @@ async def test_session_prompt_dispatch_error_server_survives(
     )
     session_id = written[0]["result"]["sessionId"]
 
-    mock_dispatch = AsyncMock(side_effect=RuntimeError("boom"))
+    server._pool.send = AsyncMock(side_effect=RuntimeError("boom"))
 
-    with patch("pykoclaw_acp.server.dispatch_to_agent", mock_dispatch):
-        await server._dispatch(
-            {
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "session/prompt",
-                "params": {
-                    "sessionId": session_id,
-                    "prompt": [{"type": "text", "text": "hello"}],
-                },
-            }
-        )
+    await server._dispatch(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "session/prompt",
+            "params": {
+                "sessionId": session_id,
+                "prompt": [{"type": "text", "text": "hello"}],
+            },
+        }
+    )
 
+    # Server should still work after the error
     await server._dispatch(
         {"jsonrpc": "2.0", "id": 3, "method": "initialize", "params": {}}
     )
@@ -271,9 +269,11 @@ async def test_main_loop_continues_after_dispatch_error(
 
 
 @pytest.mark.asyncio
-async def test_dispatch_error_does_not_catch_cancelled_error(
+async def test_pool_cancelled_error_not_swallowed(
     server: AcpServer,
 ) -> None:
+    """CancelledError from pool.send must propagate — not be caught by the
+    generic Exception handler — so that asyncio shutdown can cancel tasks."""
     written = _collect_writes(server)
 
     await server._dispatch(
@@ -281,18 +281,20 @@ async def test_dispatch_error_does_not_catch_cancelled_error(
     )
     session_id = written[0]["result"]["sessionId"]
 
-    mock_dispatch = AsyncMock(side_effect=asyncio.CancelledError())
+    server._pool.send = AsyncMock(side_effect=asyncio.CancelledError())
 
-    with patch("pykoclaw_acp.server.dispatch_to_agent", mock_dispatch):
-        with pytest.raises(asyncio.CancelledError):
-            await server._dispatch(
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "session/prompt",
-                    "params": {
-                        "sessionId": session_id,
-                        "prompt": [{"type": "text", "text": "hello"}],
-                    },
-                }
-            )
+    # The bare `except Exception` in _handle_session_prompt does NOT catch
+    # CancelledError (which inherits from BaseException), so it should
+    # propagate out.
+    with pytest.raises(asyncio.CancelledError):
+        await server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "hello"}],
+                },
+            }
+        )
