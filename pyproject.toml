@@ -15,6 +15,13 @@ acp = "pykoclaw_acp:AcpPlugin"
 [dependency-groups]
 dev = ["pytest", "pytest-asyncio"]
 
+[tool.pytest.ini_options]
+markers = [
+    "e2e: end-to-end tests requiring a running Claude API (deselected by default)",
+]
+addopts = "-m 'not e2e'"
+asyncio_mode = "auto"
+
 [build-system]
 requires = ["uv_build>=0.9.2,<0.10.0"]
 build-backend = "uv_build"
