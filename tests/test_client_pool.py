@@ -163,6 +163,36 @@ async def test_query_no_duplication_when_streamed_and_result(tmp_path, tmp_db) -
 
 
 @pytest.mark.asyncio
+async def test_disconnect_shields_cancelled_error(tmp_path, tmp_db) -> None:  # noqa: ANN001
+    """_disconnect must not leak CancelledError into the caller.
+
+    Regression test: ClaudeSDKClient.disconnect() calls anyio's
+    cancel_scope.cancel() internally, which can propagate a CancelledError
+    into the asyncio task that called it.  _disconnect() must shield this
+    so that callers (especially _sweep_loop and the main server loop) are
+    not disrupted.
+    """
+    from pykoclaw_acp.client_pool import _Entry
+
+    class CancellingClient:
+        """Simulates the real SDK: disconnect raises CancelledError."""
+
+        async def disconnect(self) -> None:
+            raise asyncio.CancelledError("cancel scope leak")
+
+    entry = _Entry(
+        client=CancellingClient(),  # type: ignore[arg-type]
+        conversation_name="acp-cancel1",
+    )
+    pool = _make_pool(tmp_path, tmp_db)
+    pool._entries["cancel-session"] = entry
+
+    # Must NOT raise CancelledError
+    await pool._disconnect("cancel-session")
+    assert "cancel-session" not in pool._entries
+
+
+@pytest.mark.asyncio
 async def test_query_no_on_text_callback(tmp_path, tmp_db) -> None:  # noqa: ANN001
     """When on_text is None, _query still completes without error."""
     client = FakeClient(

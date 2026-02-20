@@ -174,8 +174,14 @@ class ClientPool:
         entry = self._entries.pop(session_id, None)
         if entry:
             try:
-                await entry.client.disconnect()
-            except Exception:
+                # Shield the disconnect so that anyio's cancel-scope
+                # cancellation inside ClaudeSDKClient.disconnect() cannot
+                # propagate a CancelledError into the caller's task (the
+                # _sweep_loop or the main server loop).  Without this, the
+                # cancel scope set by Query.close() leaks into the asyncio
+                # event loop and spin-cancels the server's readline().
+                await asyncio.shield(entry.client.disconnect())
+            except (asyncio.CancelledError, Exception):
                 log.debug("Disconnect error for %s", session_id, exc_info=True)
 
     async def _sweep_loop(self) -> None:
