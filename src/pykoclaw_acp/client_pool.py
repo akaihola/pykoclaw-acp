@@ -173,16 +173,32 @@ class ClientPool:
     async def _disconnect(self, session_id: str) -> None:
         entry = self._entries.pop(session_id, None)
         if entry:
+            # Run disconnect in a completely separate asyncio Task so that
+            # anyio's cancel-scope machinery inside ClaudeSDKClient.disconnect()
+            # cannot inject CancelledError into the caller's task.
+            #
+            # Background: Query.close() cancels an anyio TaskGroup cancel
+            # scope, which can leak CancelledError into the asyncio event
+            # loop.  asyncio.shield() alone is NOT sufficient because it
+            # only protects against *outer* cancellation of the calling
+            # task — it does not isolate *inner* anyio cancel scope
+            # effects.  Running in a separate Task provides full isolation.
+            async def _do_disconnect() -> None:
+                try:
+                    await entry.client.disconnect()
+                except BaseException:
+                    log.debug("Disconnect error for %s", session_id, exc_info=True)
+
+            task = asyncio.create_task(_do_disconnect())
             try:
-                # Shield the disconnect so that anyio's cancel-scope
-                # cancellation inside ClaudeSDKClient.disconnect() cannot
-                # propagate a CancelledError into the caller's task (the
-                # _sweep_loop or the main server loop).  Without this, the
-                # cancel scope set by Query.close() leaks into the asyncio
-                # event loop and spin-cancels the server's readline().
-                await asyncio.shield(entry.client.disconnect())
+                await asyncio.shield(task)
             except (asyncio.CancelledError, Exception):
-                log.debug("Disconnect error for %s", session_id, exc_info=True)
+                log.debug(
+                    "Disconnect task error for %s (task done=%s)",
+                    session_id,
+                    task.done(),
+                    exc_info=True,
+                )
 
     async def _sweep_loop(self) -> None:
         while True:
@@ -195,4 +211,14 @@ class ClientPool:
             ]
             for sid in stale:
                 log.info("Evicting idle client %s", sid)
-                await self._disconnect(sid)
+                try:
+                    await self._disconnect(sid)
+                except BaseException:
+                    # Must never let disconnect failures kill the sweep loop.
+                    # CancelledError from anyio cancel scopes is the most
+                    # common offender — catch it and keep sweeping.
+                    log.warning(
+                        "Eviction of %s raised; ignoring to keep sweep alive",
+                        sid,
+                        exc_info=True,
+                    )
