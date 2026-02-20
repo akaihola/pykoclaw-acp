@@ -112,13 +112,25 @@ class ClientPool:
         async with asyncio.timeout(QUERY_TIMEOUT_S):
             await entry.client.query(prompt)
             session_id: str | None = None
+            had_text_blocks = False
             async for message in entry.client.receive_response():
                 if isinstance(message, AssistantMessage):
                     for block in message.content:
-                        if isinstance(block, TextBlock) and on_text:
-                            await on_text(block.text)
+                        if isinstance(block, TextBlock):
+                            had_text_blocks = True
+                            if on_text:
+                                await on_text(block.text)
                 elif isinstance(message, ResultMessage):
                     session_id = message.session_id
+                    # Fallback: if no TextBlock was streamed but
+                    # ResultMessage carries the response text, forward
+                    # it so the Mitto user still sees the reply.
+                    if (
+                        not had_text_blocks
+                        and message.result
+                        and on_text
+                    ):
+                        await on_text(message.result)
                     conv_dir = (
                         self._data_dir / "conversations" / entry.conversation_name
                     )
