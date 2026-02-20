@@ -21,7 +21,7 @@ class PromptResult:
     messages: list[dict[str, Any]]
 
 
-class MockClientPool:
+class MockPool:
     def __init__(self) -> None:
         self._started = False
         self._closed = False
@@ -200,15 +200,15 @@ def tmp_db() -> sqlite3.Connection:
 
 
 @pytest.fixture()
-def mock_pool() -> MockClientPool:
-    return MockClientPool()
+def mock_pool() -> MockPool:
+    return MockPool()
 
 
 @pytest.fixture()
 def acp_server(
     tmp_db: sqlite3.Connection,
     tmp_path: Path,
-    mock_pool: MockClientPool,
+    mock_pool: MockPool,
 ) -> AcpServer:
     server = AcpServer(db=tmp_db, data_dir=tmp_path)
     server._pool = mock_pool

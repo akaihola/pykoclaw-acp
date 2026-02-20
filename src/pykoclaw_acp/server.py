@@ -86,20 +86,6 @@ class AcpServer:
 
                 await self._dispatch(msg)
 
-            except asyncio.CancelledError:
-                # Safety net: anyio cancel scopes inside the claude-agent-sdk
-                # can leak CancelledError into our asyncio task (e.g. when
-                # _sweep_loop evicts an idle client).  Back off to avoid a
-                # spin loop that would peg the CPU and starve stdin reads.
-                consecutive_errors += 1
-                if consecutive_errors <= 3:
-                    log.warning("Caught stray CancelledError in main loop, backing off")
-                if consecutive_errors >= max_consecutive_errors:
-                    log.error("Too many consecutive CancelledErrors, stopping")
-                    break
-                await asyncio.sleep(0.5)
-                continue
-
             except Exception:
                 consecutive_errors += 1
                 log.exception(
@@ -125,7 +111,7 @@ class AcpServer:
             self._delivery_task.cancel()
         if hasattr(self, "_heartbeat_task"):
             self._heartbeat_task.cancel()
-        log.info("Closing client pool (%d entries)", len(self._pool._entries))
+        log.info("Closing worker pool (%d entries)", len(self._pool._entries))
         await self._pool.close()
         self._sessions.clear()
         log.info("AcpServer.stop() complete")

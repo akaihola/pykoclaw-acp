@@ -25,16 +25,11 @@ _SHUTDOWN_TIMEOUT_S = 5
 def _run_server(server: object) -> None:
     """Run the ACP server with a bounded shutdown.
 
-    We manage the event loop manually instead of using ``asyncio.run()``
-    because its cleanup phase calls ``_cancel_all_tasks()`` which waits
-    *indefinitely* for every task to finish cancellation.  If any task is
-    stuck on non-cancellable I/O (e.g. a Claude SDK subprocess), the process
-    hangs forever — the exact bug the watchdog was catching and SIGKILL-ing,
-    leaving zombies that Mitto can't reap.
-
-    By owning the loop ourselves we can enforce a hard timeout and call
-    ``os._exit()`` when tasks refuse to cancel, guaranteeing the process
-    never lingers.
+    We manage the event loop manually for defense-in-depth.  The server is
+    now pure asyncio (no anyio/SDK code in-process — that runs in worker
+    subprocesses), so ``asyncio.run()`` would likely work fine.  We keep
+    the manual loop + bounded cancellation as a safety net in case a
+    worker pipe read ever gets stuck.
     """
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -57,9 +52,9 @@ def _run_server(server: object) -> None:
 def _cancel_remaining_tasks(loop: asyncio.AbstractEventLoop) -> None:
     """Cancel all remaining tasks with a hard timeout.
 
-    If tasks don't cancel within ``_SHUTDOWN_TIMEOUT_S`` seconds, force-exit
-    the process with ``os._exit(0)`` to prevent ``asyncio.run()``-style
-    infinite hangs in ``_cancel_all_tasks()``.
+    With process-isolated workers, all tasks in this event loop are pure
+    asyncio (no anyio cancel scope leaks).  The ``os._exit()`` fallback
+    is kept as defense-in-depth but should never trigger.
     """
     tasks = [t for t in asyncio.all_tasks(loop) if not t.done()]
     if not tasks:
@@ -77,10 +72,6 @@ def _cancel_remaining_tasks(loop: asyncio.AbstractEventLoop) -> None:
             _SHUTDOWN_TIMEOUT_S,
             [t.get_name() for t in still_pending],
         )
-        # Hard exit: the only way to prevent the process from becoming a
-        # zombie when non-cancellable tasks (Claude SDK subprocesses) refuse
-        # to die.  This is safe because server.stop() already ran — all
-        # graceful cleanup that *can* happen has happened.
         os._exit(0)
 
 
