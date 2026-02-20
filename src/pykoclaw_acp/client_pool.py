@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +39,51 @@ _ALLOWED_TOOLS = [
     "WebFetch",
     "mcp__pykoclaw__*",
 ]
+
+
+_KILL_TIMEOUT_S = 3  # seconds to wait for graceful SIGTERM before SIGKILL
+
+
+async def _kill_client(client: ClaudeSDKClient, label: str = "") -> None:
+    """Tear down a ClaudeSDKClient by killing its subprocess directly.
+
+    **Never call ``client.disconnect()``.**  It invokes ``Query.close()``
+    which cancels an anyio ``TaskGroup`` cancel scope.  Anyio tracks the
+    *host task* of each cancel scope, so ``cancel_scope.cancel()`` injects
+    a ``CancelledError`` into whichever asyncio ``Task`` originally called
+    ``client.connect()`` — even if ``disconnect()`` is running in a
+    completely different task, behind ``asyncio.shield()``, etc.  This
+    kills the ACP server's main stdin-read loop every time an idle client
+    is evicted.
+
+    Instead we terminate the subprocess ourselves and null-out references
+    so the garbage collector can clean up.
+    """
+    query = client._query
+    transport = getattr(query, "transport", None) if query else None
+
+    # Mark the query as closed so the background reader stops.
+    if query:
+        query._closed = True
+
+    # Kill the subprocess.
+    if transport:
+        proc = getattr(transport, "_process", None)
+        if proc and proc.returncode is None:
+            with suppress(ProcessLookupError):
+                proc.terminate()
+            try:
+                async with asyncio.timeout(_KILL_TIMEOUT_S):
+                    await proc.wait()
+            except (TimeoutError, Exception):
+                with suppress(ProcessLookupError):
+                    proc.kill()
+                log.debug("Sent SIGKILL to client %s", label)
+
+    # Null-out references — don't call .close() or .__aexit__().
+    client._query = None
+    client._transport = None
+    log.debug("Killed client %s", label)
 
 
 @dataclass
@@ -173,32 +219,7 @@ class ClientPool:
     async def _disconnect(self, session_id: str) -> None:
         entry = self._entries.pop(session_id, None)
         if entry:
-            # Run disconnect in a completely separate asyncio Task so that
-            # anyio's cancel-scope machinery inside ClaudeSDKClient.disconnect()
-            # cannot inject CancelledError into the caller's task.
-            #
-            # Background: Query.close() cancels an anyio TaskGroup cancel
-            # scope, which can leak CancelledError into the asyncio event
-            # loop.  asyncio.shield() alone is NOT sufficient because it
-            # only protects against *outer* cancellation of the calling
-            # task — it does not isolate *inner* anyio cancel scope
-            # effects.  Running in a separate Task provides full isolation.
-            async def _do_disconnect() -> None:
-                try:
-                    await entry.client.disconnect()
-                except BaseException:
-                    log.debug("Disconnect error for %s", session_id, exc_info=True)
-
-            task = asyncio.create_task(_do_disconnect())
-            try:
-                await asyncio.shield(task)
-            except (asyncio.CancelledError, Exception):
-                log.debug(
-                    "Disconnect task error for %s (task done=%s)",
-                    session_id,
-                    task.done(),
-                    exc_info=True,
-                )
+            await _kill_client(entry.client, session_id)
 
     async def _sweep_loop(self) -> None:
         while True:

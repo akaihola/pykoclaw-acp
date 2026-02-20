@@ -163,33 +163,25 @@ async def test_query_no_duplication_when_streamed_and_result(tmp_path, tmp_db) -
 
 
 @pytest.mark.asyncio
-async def test_disconnect_shields_cancelled_error(tmp_path, tmp_db) -> None:  # noqa: ANN001
-    """_disconnect must not leak CancelledError into the caller.
-
-    Regression test: ClaudeSDKClient.disconnect() calls anyio's
-    cancel_scope.cancel() internally, which can propagate a CancelledError
-    into the asyncio task that called it.  _disconnect() must shield this
-    so that callers (especially _sweep_loop and the main server loop) are
-    not disrupted.
-    """
+async def test_disconnect_removes_entry(tmp_path, tmp_db) -> None:  # noqa: ANN001
+    """_disconnect must remove the entry and clean up without errors."""
     from pykoclaw_acp.client_pool import _Entry
 
-    class CancellingClient:
-        """Simulates the real SDK: disconnect raises CancelledError."""
+    class FakeSDKClient:
+        """Minimal stub with the attributes _kill_client accesses."""
 
-        async def disconnect(self) -> None:
-            raise asyncio.CancelledError("cancel scope leak")
+        _query = None
+        _transport = None
 
     entry = _Entry(
-        client=CancellingClient(),  # type: ignore[arg-type]
-        conversation_name="acp-cancel1",
+        client=FakeSDKClient(),  # type: ignore[arg-type]
+        conversation_name="acp-remove1",
     )
     pool = _make_pool(tmp_path, tmp_db)
-    pool._entries["cancel-session"] = entry
+    pool._entries["remove-session"] = entry
 
-    # Must NOT raise CancelledError
-    await pool._disconnect("cancel-session")
-    assert "cancel-session" not in pool._entries
+    await pool._disconnect("remove-session")
+    assert "remove-session" not in pool._entries
 
 
 @pytest.mark.asyncio
@@ -221,39 +213,30 @@ async def test_sweep_eviction_does_not_cancel_other_tasks(tmp_path, tmp_db) -> N
     CancelledError into other asyncio tasks running in the same loop.
 
     In production, ClaudeSDKClient.disconnect() uses anyio cancel scopes
-    that can propagate CancelledError into the asyncio event loop.  When
-    _sweep_loop calls _disconnect() and that raises CancelledError, it
-    must be fully contained — not reach the main server loop or any other
-    concurrent task.
+    that inject CancelledError into the host task.  _kill_client() avoids
+    this by terminating the subprocess directly without calling disconnect().
     """
     from pykoclaw_acp.client_pool import IDLE_TIMEOUT_S, _Entry
 
-    class CancelLeakingClient:
-        """Simulates anyio cancel scope leak: disconnect raises CancelledError."""
-
-        async def disconnect(self) -> None:
-            raise asyncio.CancelledError("anyio cancel scope leak")
+    class FakeSDKClient:
+        _query = None
+        _transport = None
 
     pool = _make_pool(tmp_path, tmp_db)
 
-    # Plant a stale entry that the sweep will evict
     entry = _Entry(
-        client=CancelLeakingClient(),  # type: ignore[arg-type]
+        client=FakeSDKClient(),  # type: ignore[arg-type]
         conversation_name="acp-stale123",
     )
-    # Make it look very stale (older than IDLE_TIMEOUT_S)
     import time
     entry.last_used = time.monotonic() - IDLE_TIMEOUT_S - 100
-
     pool._entries["stale-session"] = entry
 
-    # A concurrent task that should survive the eviction
     survivor_cancelled = False
 
     async def survivor_task() -> None:
         nonlocal survivor_cancelled
         try:
-            # Wait long enough for the sweep to run and evict the stale client
             await asyncio.sleep(5)
         except asyncio.CancelledError:
             survivor_cancelled = True
@@ -261,23 +244,18 @@ async def test_sweep_eviction_does_not_cancel_other_tasks(tmp_path, tmp_db) -> N
 
     survivor = asyncio.create_task(survivor_task())
 
-    # Temporarily lower the sweep interval so it fires quickly
     import pykoclaw_acp.client_pool as pool_mod
     orig_sweep = pool_mod.SWEEP_INTERVAL_S
-    pool_mod.SWEEP_INTERVAL_S = 0.05  # 50ms
+    pool_mod.SWEEP_INTERVAL_S = 0.05
     try:
         await pool.start()
 
-        # Give the sweep loop time to detect and evict the stale entry
         for _ in range(50):
             await asyncio.sleep(0.02)
             if "stale-session" not in pool._entries:
                 break
 
-        # Stale entry should have been evicted
         assert "stale-session" not in pool._entries, "sweep didn't evict stale entry"
-
-        # The survivor task must NOT have been cancelled
         assert not survivor_cancelled, (
             "CancelledError from disconnect leaked to unrelated task"
         )
@@ -292,34 +270,20 @@ async def test_sweep_eviction_does_not_cancel_other_tasks(tmp_path, tmp_db) -> N
 
 
 @pytest.mark.asyncio
-async def test_sweep_loop_survives_disconnect_errors(tmp_path, tmp_db) -> None:  # noqa: ANN001
-    """_sweep_loop must keep running even when disconnect raises exceptions.
-
-    Regression: if _disconnect leaks an exception (CancelledError or other),
-    the sweep loop must catch it and continue — not crash and leave all
-    future idle clients unreaped.
-    """
+async def test_sweep_evicts_multiple_stale_entries(tmp_path, tmp_db) -> None:  # noqa: ANN001
+    """Multiple stale entries should all be evicted in a single sweep pass."""
     from pykoclaw_acp.client_pool import IDLE_TIMEOUT_S, _Entry
 
-    disconnect_call_count = 0
-
-    class FailingClient:
-        """disconnect() always raises."""
-
-        async def disconnect(self) -> None:
-            nonlocal disconnect_call_count
-            disconnect_call_count += 1
-            raise RuntimeError("subprocess died")
+    class FakeSDKClient:
+        _query = None
+        _transport = None
 
     pool = _make_pool(tmp_path, tmp_db)
 
     import time
-
-    # Plant two stale entries — both should be evicted even if the first
-    # disconnect raises an error.
-    for i in range(2):
+    for i in range(3):
         entry = _Entry(
-            client=FailingClient(),  # type: ignore[arg-type]
+            client=FakeSDKClient(),  # type: ignore[arg-type]
             conversation_name=f"acp-stale{i}",
         )
         entry.last_used = time.monotonic() - IDLE_TIMEOUT_S - 100
@@ -339,44 +303,45 @@ async def test_sweep_loop_survives_disconnect_errors(tmp_path, tmp_db) -> None: 
         assert len(pool._entries) == 0, (
             f"Expected all stale entries evicted, but {len(pool._entries)} remain"
         )
-        assert disconnect_call_count == 2
     finally:
         pool_mod.SWEEP_INTERVAL_S = orig_sweep
         await pool.close()
 
 
 @pytest.mark.asyncio
-async def test_disconnect_isolates_anyio_cancel_scope(tmp_path, tmp_db) -> None:  # noqa: ANN001
-    """_disconnect runs client.disconnect() in a separate Task so that anyio
-    cancel scope effects are fully isolated from the calling task.
+async def test_kill_client_terminates_subprocess(tmp_path) -> None:  # noqa: ANN001
+    """_kill_client must terminate the subprocess and null out references."""
+    from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
-    This tests the specific fix: even if disconnect() cancels the *current*
-    asyncio task (which is what anyio cancel scopes can do), _disconnect's
-    caller must not be affected.
-    """
-    from pykoclaw_acp.client_pool import _Entry
+    from pykoclaw_acp.client_pool import _kill_client
 
-    class AnyioCancelScopeClient:
-        """Simulates the real SDK: disconnect cancels the current task via
-        anyio's cancel scope, not just by raising CancelledError."""
+    # Build a fake client with the structure _kill_client expects
+    proc = AsyncMock()
+    proc.returncode = None  # process is "running"
+    proc.terminate = MagicMock()
+    proc.kill = MagicMock()
+    proc.wait = AsyncMock()
 
-        async def disconnect(self) -> None:
-            # This simulates what happens when anyio's
-            # TaskGroup.cancel_scope.cancel() runs — it cancels the
-            # *current* asyncio task.
-            current_task = asyncio.current_task()
-            if current_task:
-                current_task.cancel()
-            # Yield control so the cancellation takes effect
-            await asyncio.sleep(0)
+    transport = MagicMock()
+    transport._process = proc
 
-    entry = _Entry(
-        client=AnyioCancelScopeClient(),  # type: ignore[arg-type]
-        conversation_name="acp-cancel-scope",
-    )
-    pool = _make_pool(tmp_path, tmp_db)
-    pool._entries["cancel-scope-session"] = entry
+    query = MagicMock()
+    query.transport = transport
+    query._closed = False
 
-    # _disconnect must NOT propagate the task cancellation to its caller
-    await pool._disconnect("cancel-scope-session")
-    assert "cancel-scope-session" not in pool._entries
+    client = MagicMock()
+    client._query = query
+    client._transport = transport
+
+    await _kill_client(client, "test-label")
+
+    # Process should have been terminated
+    proc.terminate.assert_called_once()
+    proc.wait.assert_awaited_once()
+
+    # References should be nulled
+    assert client._query is None
+    assert client._transport is None
+
+    # Query should be marked closed
+    assert query._closed is True
