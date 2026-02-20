@@ -17,7 +17,7 @@ from pykoclaw.db import (
     mark_delivery_failed,
 )
 
-from .client_pool import ClientPool
+from .worker_pool import WorkerPool
 from .protocol import AcpProtocolHandler, JsonRpcError
 from .watchdog import Watchdog
 
@@ -40,7 +40,7 @@ class AcpServer:
         self._data_dir = data_dir
         self._protocol = AcpProtocolHandler()
         self._sessions: dict[str, dict[str, Any]] = {}
-        self._pool = ClientPool(db=db, data_dir=data_dir)
+        self._pool = WorkerPool(db=db, data_dir=data_dir)
         self._running = False
         self._watchdog = watchdog
 
