@@ -1,7 +1,7 @@
 # Implementation Plan: Process-Isolated SDK Workers
 
 **Backlog ref:** [001-acp-architecture-fragility.md]
-**Status:** Draft
+**Status:** Done
 **Created:** 2026-02-21
 **Feature branch:** `feature/process-isolated-workers`
 

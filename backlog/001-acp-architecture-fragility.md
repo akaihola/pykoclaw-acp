@@ -1,7 +1,7 @@
 # Backlog: ACP Architecture Fragility — Process-Isolate the SDK
 
 **Priority:** High
-**Status:** Open
+**Status:** Done
 **Created:** 2026-02-21
 **Tags:** architecture, acp, anyio, stability
 
