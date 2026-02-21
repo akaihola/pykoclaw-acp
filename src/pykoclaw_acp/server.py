@@ -12,6 +12,7 @@ from typing import Any
 
 from pykoclaw.db import (
     DbConnection,
+    get_conversation,
     get_pending_deliveries,
     mark_delivered,
     mark_delivery_failed,
@@ -137,6 +138,7 @@ class AcpServer:
         handler = {
             "initialize": self._handle_initialize,
             "session/new": self._handle_session_new,
+            "session/load": self._handle_session_load,
             "session/prompt": self._handle_session_prompt,
         }.get(method)
 
@@ -160,7 +162,7 @@ class AcpServer:
     async def _handle_initialize(self, msg_id: Any, params: dict[str, Any]) -> None:
         result = {
             "protocolVersion": PROTOCOL_VERSION,
-            "agentCapabilities": {},
+            "agentCapabilities": {"loadSession": True},
             "agentInfo": {"name": "pykoclaw", "version": "0.1.0"},
         }
         self._write(self._protocol.format_response(msg_id, result))
@@ -171,6 +173,42 @@ class AcpServer:
             "cwd": params.get("cwd", ""),
         }
         self._write(self._protocol.format_response(msg_id, {"sessionId": session_id}))
+
+    async def _handle_session_load(self, msg_id: Any, params: dict[str, Any]) -> None:
+        session_id = params.get("sessionId", "")
+        cwd = params.get("cwd", "")
+
+        if not session_id:
+            self._write(
+                self._protocol.format_error(
+                    msg_id, JsonRpcError.INVALID_PARAMS, "sessionId is required"
+                )
+            )
+            return
+
+        # Look up the conversation for this ACP session ID
+        conversation_name = f"acp-{session_id[:8]}"
+        conv = get_conversation(self._db, conversation_name)
+
+        if not conv or not conv.session_id:
+            self._write(
+                self._protocol.format_error(
+                    msg_id,
+                    JsonRpcError.SESSION_ERROR,
+                    f"No prior session found for {session_id}",
+                )
+            )
+            return
+
+        # Register session with resume info for the first prompt
+        self._sessions[session_id] = {
+            "cwd": cwd,
+            "resume_session_id": conv.session_id,
+        }
+        log.info(
+            "Session loaded: acp=%s, claude_session=%s", session_id, conv.session_id
+        )
+        self._write(self._protocol.format_response(msg_id, {}))
 
     async def _handle_session_prompt(self, msg_id: Any, params: dict[str, Any]) -> None:
         session_id = params.get("sessionId")
@@ -217,8 +255,13 @@ class AcpServer:
                 )
             )
 
+        session = self._sessions[session_id]
+        resume_id = session.pop("resume_session_id", None)
+
         try:
-            await self._pool.send(session_id, content, on_text=_send_chunk)
+            await self._pool.send(
+                session_id, content, on_text=_send_chunk, resume_session_id=resume_id
+            )
         except Exception:
             log.exception("Agent dispatch failed for session %s", session_id)
             self._write(

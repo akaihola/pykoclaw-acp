@@ -43,6 +43,7 @@ class MockPool:
         prompt: str,
         *,
         on_text: Callable[[str], Awaitable[None]] | None = None,
+        resume_session_id: str | None = None,
     ) -> str | None:
         self.session_history.setdefault(session_id, []).append(prompt)
         self._send_count += 1

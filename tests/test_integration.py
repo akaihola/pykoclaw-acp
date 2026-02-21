@@ -19,7 +19,7 @@ async def test_initialize_before_anything(
 ) -> None:
     result = await acp_client.initialize()
     assert result["protocolVersion"] == 1
-    assert result["agentCapabilities"] == {}
+    assert result["agentCapabilities"] == {"loadSession": True}
     assert result["agentInfo"]["name"] == "pykoclaw"
     assert result["agentInfo"]["version"] == "0.1.0"
 

@@ -69,6 +69,7 @@ class WorkerConfig:
     db_path: str = ""
     cli_path: str | None = None
     allowed_tools: list[str] = field(default_factory=list)
+    resume_session_id: str | None = None
 
 
 # -- Type aliases -------------------------------------------------------------
@@ -129,4 +130,5 @@ def decode_config(line: str) -> WorkerConfig:
         db_path=data.get("db_path", ""),
         cli_path=data.get("cli_path"),
         allowed_tools=data.get("allowed_tools", []),
+        resume_session_id=data.get("resume_session_id"),
     )

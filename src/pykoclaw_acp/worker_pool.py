@@ -105,13 +105,16 @@ class WorkerPool:
         prompt: str,
         *,
         on_text: Callable[[str], Awaitable[None]] | None = None,
+        resume_session_id: str | None = None,
     ) -> str | None:
         """Send *prompt* to the worker for *session_id*, streaming via *on_text*.
 
         Creates the worker on first call.  Returns the session ID from the
         worker's result message.
         """
-        handle = await self._get_or_create(session_id)
+        handle = await self._get_or_create(
+            session_id, resume_session_id=resume_session_id
+        )
         async with handle.lock:
             handle.last_used = time.monotonic()
             try:
@@ -162,7 +165,9 @@ class WorkerPool:
                 # Ignore messages with non-matching ids (shouldn't happen
                 # since we hold the lock, but be defensive).
 
-    async def _get_or_create(self, session_id: str) -> _WorkerHandle:
+    async def _get_or_create(
+        self, session_id: str, *, resume_session_id: str | None = None
+    ) -> _WorkerHandle:
         if session_id in self._entries:
             return self._entries[session_id]
 
@@ -170,12 +175,16 @@ class WorkerPool:
             if session_id in self._entries:
                 return self._entries[session_id]
 
-            handle = await self._spawn_worker(session_id)
+            handle = await self._spawn_worker(
+                session_id, resume_session_id=resume_session_id
+            )
             self._entries[session_id] = handle
             log.info("Spawned worker for session %s", session_id)
             return handle
 
-    async def _spawn_worker(self, session_id: str) -> _WorkerHandle:
+    async def _spawn_worker(
+        self, session_id: str, *, resume_session_id: str | None = None
+    ) -> _WorkerHandle:
         conversation_name = f"acp-{session_id[:8]}"
         conv_dir = self._data_dir / "conversations" / conversation_name
         conv_dir.mkdir(parents=True, exist_ok=True)
@@ -187,6 +196,7 @@ class WorkerPool:
             db_path=str(settings.db_path),
             cli_path=str(settings.cli_path) if settings.cli_path else None,
             allowed_tools=list(_ALLOWED_TOOLS),
+            resume_session_id=resume_session_id,
         )
 
         process = await asyncio.create_subprocess_exec(
