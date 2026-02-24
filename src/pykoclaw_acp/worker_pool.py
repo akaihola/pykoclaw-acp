@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pykoclaw.config import settings
-from pykoclaw.db import DbConnection
+from pykoclaw.db import DbConnection, get_conversation
 
 from .worker_protocol import (
     ErrorMessage,
@@ -91,9 +91,7 @@ class WorkerPool:
             *(self._shutdown_worker(sid) for sid in sids),
             return_exceptions=True,
         )
-        errors = [
-            (sid, r) for sid, r in zip(sids, results) if isinstance(r, Exception)
-        ]
+        errors = [(sid, r) for sid, r in zip(sids, results) if isinstance(r, Exception)]
         if errors:
             for sid, exc in errors:
                 log.warning("WorkerPool: error shutting down %s: %s", sid, exc)
@@ -120,9 +118,7 @@ class WorkerPool:
             try:
                 return await self._query(handle, prompt, on_text)
             except Exception:
-                log.warning(
-                    "Worker %s crashed, recreating", session_id, exc_info=True
-                )
+                log.warning("Worker %s crashed, recreating", session_id, exc_info=True)
                 await self._shutdown_worker(session_id)
                 handle = await self._get_or_create(session_id)
                 async with handle.lock:
@@ -175,6 +171,21 @@ class WorkerPool:
             if session_id in self._entries:
                 return self._entries[session_id]
 
+            # If no explicit resume ID was given (e.g. worker was evicted after
+            # being idle), look up the stored claude session ID from the DB so
+            # the new worker can resume the existing conversation rather than
+            # starting fresh.
+            if resume_session_id is None:
+                conversation_name = f"acp-{session_id[:8]}"
+                conv = get_conversation(self._db, conversation_name)
+                if conv and conv.session_id:
+                    resume_session_id = conv.session_id
+                    log.info(
+                        "Resuming evicted worker %s from stored claude session %s",
+                        session_id,
+                        resume_session_id,
+                    )
+
             handle = await self._spawn_worker(
                 session_id, resume_session_id=resume_session_id
             )
@@ -217,9 +228,7 @@ class WorkerPool:
                 while True:
                     raw = await process.stdout.readline()
                     if not raw:
-                        raise RuntimeError(
-                            "Worker process exited before sending ready"
-                        )
+                        raise RuntimeError("Worker process exited before sending ready")
                     line = raw.decode().strip()
                     if not line:
                         continue
@@ -228,9 +237,7 @@ class WorkerPool:
                         break
                     if isinstance(msg, HeartbeatMessage):
                         continue
-                    raise RuntimeError(
-                        f"Expected ready message, got: {msg}"
-                    )
+                    raise RuntimeError(f"Expected ready message, got: {msg}")
         except (TimeoutError, RuntimeError):
             process.kill()
             await process.wait()
@@ -314,9 +321,7 @@ class WorkerPool:
         except asyncio.CancelledError:
             pass
         except Exception:
-            log.debug(
-                "stderr forwarder for %s stopped", session_id, exc_info=True
-            )
+            log.debug("stderr forwarder for %s stopped", session_id, exc_info=True)
 
     @staticmethod
     async def _write_to_worker(handle: _WorkerHandle, data: str) -> None:
@@ -325,9 +330,7 @@ class WorkerPool:
         await handle.process.stdin.drain()
 
     @staticmethod
-    async def _write_to_process(
-        process: asyncio.subprocess.Process, data: str
-    ) -> None:
+    async def _write_to_process(process: asyncio.subprocess.Process, data: str) -> None:
         assert process.stdin is not None
         process.stdin.write(data.encode())
         await process.stdin.drain()

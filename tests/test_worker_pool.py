@@ -203,7 +203,9 @@ async def test_send_basic(tmp_path: Path, tmp_db: sqlite3.Connection) -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_multiple_prompts(tmp_path: Path, tmp_db: sqlite3.Connection) -> None:
+async def test_send_multiple_prompts(
+    tmp_path: Path, tmp_db: sqlite3.Connection
+) -> None:
     """Multiple sends on the same session reuse the same worker."""
     script = _mock_worker_script(tmp_path)
     pool = _make_pool(tmp_path, tmp_db, script)
@@ -213,8 +215,12 @@ async def test_send_multiple_prompts(tmp_path: Path, tmp_db: sqlite3.Connection)
         chunks_1: list[str] = []
         chunks_2: list[str] = []
 
-        r1 = await pool.send("sess-multi", "First", on_text=lambda t: _append(chunks_1, t))
-        r2 = await pool.send("sess-multi", "Second", on_text=lambda t: _append(chunks_2, t))
+        r1 = await pool.send(
+            "sess-multi", "First", on_text=lambda t: _append(chunks_1, t)
+        )
+        r2 = await pool.send(
+            "sess-multi", "Second", on_text=lambda t: _append(chunks_2, t)
+        )
 
         assert r1 == "mock-sess-123"
         assert r2 == "mock-sess-123"
@@ -283,7 +289,9 @@ async def test_worker_crash_retry(tmp_path: Path, tmp_db: sqlite3.Connection) ->
 
 
 @pytest.mark.asyncio
-async def test_close_shuts_down_workers(tmp_path: Path, tmp_db: sqlite3.Connection) -> None:
+async def test_close_shuts_down_workers(
+    tmp_path: Path, tmp_db: sqlite3.Connection
+) -> None:
     """close() shuts down all worker processes."""
     script = _mock_worker_script(tmp_path)
     pool = _make_pool(tmp_path, tmp_db, script)
@@ -306,6 +314,110 @@ async def test_close_shuts_down_workers(tmp_path: Path, tmp_db: sqlite3.Connecti
     # All processes should have exited
     for proc in processes:
         assert proc.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_resume_after_eviction(
+    tmp_path: Path, tmp_db: sqlite3.Connection
+) -> None:
+    """After idle eviction, re-spawned worker is given the stored claude session ID.
+
+    Regression test for: worker evicted → next prompt spawns fresh worker with
+    resume_session_id=None → context lost.  Fix: _get_or_create looks up the
+    stored session ID from the DB when resume_session_id is not explicitly given.
+    """
+    # Mock worker that echoes back the resume_session_id from its config
+    script = tmp_path / "resume_echo_worker.py"
+    script.write_text(
+        dedent(
+            """\
+            import json
+            import sys
+
+            def write_msg(data):
+                sys.stdout.write(json.dumps(data) + "\\n")
+                sys.stdout.flush()
+
+            def main():
+                config_line = sys.stdin.readline()
+                if not config_line:
+                    return
+                config = json.loads(config_line)
+                resume_id = config.get("resume_session_id") or ""
+
+                write_msg({"type": "ready"})
+
+                while True:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    msg = json.loads(line.strip())
+                    if msg.get("type") == "shutdown":
+                        break
+                    if msg.get("type") == "query":
+                        msg_id = msg["id"]
+                        # Echo the resume_session_id back as text
+                        write_msg({"type": "text", "id": msg_id, "text": resume_id})
+                        write_msg({"type": "result", "id": msg_id, "session_id": "new-sess-xyz"})
+
+            if __name__ == "__main__":
+                main()
+            """
+        )
+    )
+
+    pool = _make_pool(tmp_path, tmp_db, script)
+
+    # Prime the DB: simulate that the conversation already has a stored session ID
+    # (as if the worker had run before and written it via upsert_conversation).
+    conv_name = "acp-evict-re"  # first 8 chars of "evict-resume-test"
+    tmp_db.execute(
+        "INSERT INTO conversations (name, session_id, cwd, created_at) VALUES (?, ?, ?, ?)",
+        (conv_name, "stored-claude-sess-abc", "/tmp", "2026-01-01T00:00:00"),
+    )
+    tmp_db.commit()
+
+    session_id = "evict-resume-test"
+
+    # First send: worker is spawned with resume_session_id passed explicitly
+    chunks_1: list[str] = []
+
+    async def collect_1(text: str) -> None:
+        chunks_1.append(text)
+
+    await pool.send(
+        session_id,
+        "first",
+        on_text=collect_1,
+        resume_session_id="stored-claude-sess-abc",
+    )
+    # Worker echoes back the resume ID it received
+    assert chunks_1 == ["stored-claude-sess-abc"]
+
+    # Simulate eviction: remove entry from pool (kill the process cleanly)
+    handle = pool._entries.pop(session_id)
+    handle.process.kill()
+    await handle.process.wait()
+
+    # Second send: no explicit resume_session_id — should be looked up from DB
+    chunks_2: list[str] = []
+
+    async def collect_2(text: str) -> None:
+        chunks_2.append(text)
+
+    await pool.send(
+        session_id,
+        "after eviction",
+        on_text=collect_2,
+    )
+
+    # The re-spawned worker must have received the stored session ID, not empty
+    assert chunks_2 == ["stored-claude-sess-abc"], (
+        f"Expected resume with 'stored-claude-sess-abc', got: {chunks_2!r}. "
+        "Worker was spawned without resume_session_id after eviction."
+    )
+
+    await pool.close()
 
 
 @pytest.mark.asyncio
