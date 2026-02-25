@@ -13,8 +13,8 @@ from textwrap import dedent
 
 import pytest
 
+from pykoclaw.config import settings
 from pykoclaw_acp.worker_pool import (
-    IDLE_TIMEOUT_S,
     WorkerPool,
     _WorkerHandle,
 )
@@ -249,7 +249,7 @@ async def test_idle_eviction(tmp_path: Path, tmp_db: sqlite3.Connection) -> None
     await pool.send("evict-me", "hi")
 
     # Backdate last_used so it looks idle
-    pool._entries["evict-me"].last_used = time.monotonic() - IDLE_TIMEOUT_S - 100
+    pool._entries["evict-me"].last_used = time.monotonic() - settings.idle_timeout - 100
 
     orig_sweep = wp_mod.SWEEP_INTERVAL_S
     wp_mod.SWEEP_INTERVAL_S = 0.05

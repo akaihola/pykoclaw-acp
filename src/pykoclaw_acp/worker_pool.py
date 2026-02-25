@@ -29,7 +29,6 @@ from .worker_protocol import (
 
 log = logging.getLogger(__name__)
 
-IDLE_TIMEOUT_S = 600
 SWEEP_INTERVAL_S = 60
 QUERY_TIMEOUT_S = 600
 WORKER_READY_TIMEOUT_S = 30
@@ -114,7 +113,6 @@ class WorkerPool:
             session_id, resume_session_id=resume_session_id
         )
         async with handle.lock:
-            handle.last_used = time.monotonic()
             try:
                 return await self._query(handle, prompt, on_text)
             except Exception:
@@ -148,6 +146,11 @@ class WorkerPool:
                     continue
 
                 msg = decode_worker_message(line)
+
+                # Any message from the worker proves it's alive — keep the
+                # idle clock ticking so long-running queries that exceed
+                # idle_timeout aren't at risk if the lock check ever changes.
+                handle.last_used = time.monotonic()
 
                 if isinstance(msg, TextChunkMessage) and msg.id == msg_id:
                     if on_text:
@@ -293,7 +296,7 @@ class WorkerPool:
             stale = [
                 sid
                 for sid, h in self._entries.items()
-                if now - h.last_used > IDLE_TIMEOUT_S and not h.lock.locked()
+                if now - h.last_used > settings.idle_timeout and not h.lock.locked()
             ]
             for sid in stale:
                 log.info("Evicting idle worker %s", sid)
