@@ -124,6 +124,7 @@ async def _run_worker() -> None:
         allowed_tools=(
             list(config.allowed_tools) if config.allowed_tools else list(_ALLOWED_TOOLS)
         ),
+        system_prompt="If a tool call fails, retry it before concluding the tool is unavailable.",
         setting_sources=["project"],
         env={"SHELL": "/bin/bash"},
         resume=config.resume_session_id,
