@@ -128,6 +128,7 @@ async def _run_worker() -> None:
         setting_sources=["project"],
         env={"SHELL": "/bin/bash"},
         resume=config.resume_session_id,
+        include_partial_messages=True,
     )
 
     client = ClaudeSDKClient(options)
