@@ -17,6 +17,7 @@ from pykoclaw.db import (
     mark_delivered,
     mark_delivery_failed,
 )
+from pykoclaw.plugins import TransformContext, compose_transformers, load_plugins
 
 from .worker_pool import WorkerPool
 from .protocol import AcpProtocolHandler, JsonRpcError
@@ -241,26 +242,18 @@ class AcpServer:
             )
             return
 
-        async def _send_chunk(text: str) -> None:
-            self._write(
-                self._protocol.format_notification(
-                    "session/update",
-                    {
-                        "sessionId": session_id,
-                        "update": {
-                            "sessionUpdate": "agent_message_chunk",
-                            "content": {"type": "text", "text": text},
-                        },
-                    },
-                )
-            )
+        # Accumulate chunks; transform is applied to the full assembled text.
+        chunks: list[str] = []
+
+        async def _collect_chunk(text: str) -> None:
+            chunks.append(text)
 
         session = self._sessions[session_id]
         resume_id = session.pop("resume_session_id", None)
 
         try:
             await self._pool.send(
-                session_id, content, on_text=_send_chunk, resume_session_id=resume_id
+                session_id, content, on_text=_collect_chunk, resume_session_id=resume_id
             )
         except Exception:
             log.exception("Agent dispatch failed for session %s", session_id)
@@ -272,6 +265,31 @@ class AcpServer:
                         "update": {
                             "sessionUpdate": "error",
                             "error": "Agent processing failed. Please try again.",
+                        },
+                    },
+                )
+            )
+            self._write(
+                self._protocol.format_response(msg_id, {"stopReason": "end_turn"})
+            )
+            return
+
+        # Apply plugin response transforms to the fully assembled text.
+        full_text = "".join(chunks)
+        if full_text:
+            ctx = TransformContext(
+                channel_prefix="acp", native_file_extensions=frozenset()
+            )
+            transform = compose_transformers(load_plugins(), ctx)
+            full_text = transform(full_text)
+            self._write(
+                self._protocol.format_notification(
+                    "session/update",
+                    {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": full_text},
                         },
                     },
                 )

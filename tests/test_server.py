@@ -7,7 +7,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -298,3 +298,149 @@ async def test_pool_cancelled_error_not_swallowed(
                 },
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# Response transform pipeline
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_prompt_applies_transform(
+    server: AcpServer,
+) -> None:
+    """Plugin response transforms must be applied to the full assembled text.
+
+    We inject a simple stub transform (via mock) that uppercases text so the
+    test is independent of any installed plugin.
+    """
+    from unittest.mock import patch
+
+    written = _collect_writes(server)
+
+    # Create a session
+    await server._dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}}
+    )
+    session_id = written[0]["result"]["sessionId"]
+    written.clear()
+
+    # Mock pool.send to emit two chunks then finish
+    async def fake_send(sid, prompt, *, on_text=None, resume_session_id=None):
+        if on_text:
+            await on_text("hello ")
+            await on_text("world")
+        return None
+
+    server._pool.send = fake_send  # type: ignore[assignment]
+
+    # Stub compose_transformers to return an uppercase transform
+    def fake_compose(plugins, ctx):
+        return lambda text: text.upper()
+
+    with (
+        patch("pykoclaw_acp.server.compose_transformers", fake_compose),
+        patch("pykoclaw_acp.server.load_plugins", return_value=[]),
+    ):
+        await server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "say hello"}],
+                },
+            }
+        )
+
+    # One session/update notification with the transformed (uppercased) text
+    updates = [
+        m
+        for m in written
+        if m.get("method") == "session/update"
+        and m.get("params", {}).get("update", {}).get("sessionUpdate")
+        == "agent_message_chunk"
+    ]
+    assert len(updates) == 1
+    assert updates[0]["params"]["update"]["content"]["text"] == "HELLO WORLD"
+
+
+@pytest.mark.asyncio
+async def test_session_prompt_empty_agent_response_skips_notification(
+    server: AcpServer,
+) -> None:
+    """If the agent emits no text, no session/update notification is sent."""
+    written = _collect_writes(server)
+
+    await server._dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}}
+    )
+    session_id = written[0]["result"]["sessionId"]
+    written.clear()
+
+    async def fake_send_empty(sid, prompt, *, on_text=None, resume_session_id=None):
+        return None  # no on_text calls
+
+    server._pool.send = fake_send_empty  # type: ignore[assignment]
+
+    with (
+        patch("pykoclaw_acp.server.compose_transformers", lambda p, c: lambda t: t),
+        patch("pykoclaw_acp.server.load_plugins", return_value=[]),
+    ):
+        await server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "hello"}],
+                },
+            }
+        )
+
+    updates = [
+        m
+        for m in written
+        if m.get("method") == "session/update"
+        and m.get("params", {}).get("update", {}).get("sessionUpdate")
+        == "agent_message_chunk"
+    ]
+    assert len(updates) == 0
+
+
+@pytest.mark.asyncio
+async def test_session_prompt_error_sends_end_turn(
+    server: AcpServer,
+) -> None:
+    """On pool.send failure the server still sends the prompt response."""
+    written = _collect_writes(server)
+
+    await server._dispatch(
+        {"jsonrpc": "2.0", "id": 1, "method": "session/new", "params": {}}
+    )
+    session_id = written[0]["result"]["sessionId"]
+    written.clear()
+
+    server._pool.send = AsyncMock(side_effect=RuntimeError("boom"))
+
+    with (
+        patch("pykoclaw_acp.server.compose_transformers", lambda p, c: lambda t: t),
+        patch("pykoclaw_acp.server.load_plugins", return_value=[]),
+    ):
+        await server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "session/prompt",
+                "params": {
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": "hello"}],
+                },
+            }
+        )
+
+    responses = [m for m in written if "result" in m and m.get("id") == 2]
+    assert responses, "prompt response with stopReason must be sent even on error"
+    assert responses[0]["result"]["stopReason"] == "end_turn"

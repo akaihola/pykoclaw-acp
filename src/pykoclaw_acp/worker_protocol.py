@@ -70,13 +70,18 @@ class WorkerConfig:
     cli_path: str | None = None
     allowed_tools: list[str] = field(default_factory=list)
     resume_session_id: str | None = None
+    system_prompt: str | None = None
 
 
 # -- Type aliases -------------------------------------------------------------
 
 ServerMessage = QueryMessage | ShutdownMessage
 WorkerMessage = (
-    ReadyMessage | TextChunkMessage | WorkerResultMessage | ErrorMessage | HeartbeatMessage
+    ReadyMessage
+    | TextChunkMessage
+    | WorkerResultMessage
+    | ErrorMessage
+    | HeartbeatMessage
 )
 
 
@@ -131,4 +136,5 @@ def decode_config(line: str) -> WorkerConfig:
         cli_path=data.get("cli_path"),
         allowed_tools=data.get("allowed_tools", []),
         resume_session_id=data.get("resume_session_id"),
+        system_prompt=data.get("system_prompt"),
     )

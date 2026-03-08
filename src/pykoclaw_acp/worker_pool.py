@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pykoclaw.config import settings
 from pykoclaw.db import DbConnection, get_conversation
+from pykoclaw.plugins import compose_system_prompt_additions, load_plugins
 
 from .worker_protocol import (
     ErrorMessage,
@@ -203,6 +204,8 @@ class WorkerPool:
         conv_dir = self._data_dir / "conversations" / conversation_name
         conv_dir.mkdir(parents=True, exist_ok=True)
 
+        system_prompt = compose_system_prompt_additions(load_plugins())
+
         config = WorkerConfig(
             cwd=str(conv_dir),
             model=settings.model,
@@ -211,6 +214,7 @@ class WorkerPool:
             cli_path=str(settings.cli_path) if settings.cli_path else None,
             allowed_tools=list(_ALLOWED_TOOLS),
             resume_session_id=resume_session_id,
+            system_prompt=system_prompt,
         )
 
         process = await asyncio.create_subprocess_exec(

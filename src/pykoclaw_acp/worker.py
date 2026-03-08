@@ -25,7 +25,6 @@ from .worker_protocol import (
     ReadyMessage,
     ShutdownMessage,
     TextChunkMessage,
-    WorkerConfig,
     WorkerMessage,
     WorkerResultMessage,
     decode_config,
@@ -114,6 +113,16 @@ async def _run_worker() -> None:
     db = init_db(Path(config.db_path))
     mcp_server = make_mcp_server(db, config.conversation_name)
 
+    # Build the system prompt: base instruction + any plugin additions.
+    _BASE_PROMPT = (
+        "If a tool call fails, retry it before concluding the tool is unavailable."
+    )
+    system_prompt = (
+        f"{_BASE_PROMPT}\n\n{config.system_prompt}"
+        if config.system_prompt
+        else _BASE_PROMPT
+    )
+
     # Create and connect the SDK client
     options = ClaudeAgentOptions(
         cwd=config.cwd,
@@ -124,7 +133,7 @@ async def _run_worker() -> None:
         allowed_tools=(
             list(config.allowed_tools) if config.allowed_tools else list(_ALLOWED_TOOLS)
         ),
-        system_prompt="If a tool call fails, retry it before concluding the tool is unavailable.",
+        system_prompt=system_prompt,
         setting_sources=["project"],
         env={"SHELL": "/bin/bash"},
         resume=config.resume_session_id,

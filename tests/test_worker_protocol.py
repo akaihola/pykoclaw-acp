@@ -77,6 +77,7 @@ class TestWorkerConfigRoundTrip:
         assert decoded == original
         assert decoded.cli_path is None
         assert decoded.allowed_tools == []
+        assert decoded.system_prompt is None
 
     def test_all_fields_populated(self) -> None:
         original = WorkerConfig(
@@ -89,6 +90,18 @@ class TestWorkerConfigRoundTrip:
         )
         decoded = decode_config(encode(original))
         assert decoded == original
+
+    def test_system_prompt_round_trips(self) -> None:
+        """system_prompt survives encode → decode."""
+        original = WorkerConfig(system_prompt="Always use Markdown links for files.")
+        decoded = decode_config(encode(original))
+        assert decoded.system_prompt == "Always use Markdown links for files."
+
+    def test_system_prompt_none_round_trips(self) -> None:
+        """Absent system_prompt decodes as None (backward compat with old workers)."""
+        raw = '{"cwd":"","model":"","conversation_name":"","db_path":""}'
+        decoded = decode_config(raw + "\n")
+        assert decoded.system_prompt is None
 
 
 # -- Field correctness --------------------------------------------------------
@@ -136,7 +149,9 @@ class TestEncodeFormat:
             WorkerConfig(),
         ]:
             encoded = encode(msg)
-            assert encoded.endswith("\n"), f"{type(msg).__name__} missing trailing newline"
+            assert encoded.endswith("\n"), (
+                f"{type(msg).__name__} missing trailing newline"
+            )
             # Only one newline (it's a single JSON line).
             assert encoded.count("\n") == 1
 

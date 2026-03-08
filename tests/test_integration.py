@@ -34,8 +34,9 @@ async def test_full_session_lifecycle(
     prompt_text = "Explain what this repository does"
     result = await acp_client.prompt(session_id, prompt_text)
 
-    assert len(result.chunks) >= 2
-    assert "".join(result.chunks) == _expected_response(prompt_text, turn=1, call=1)
+    # Server accumulates all streamed chunks and emits one transformed notification.
+    assert len(result.chunks) == 1
+    assert result.chunks[0] == _expected_response(prompt_text, turn=1, call=1)
     assert result.stop_response is not None
     assert result.stop_response["result"]["stopReason"] == "end_turn"
     assert result.error_updates == []
@@ -135,15 +136,17 @@ async def test_error_empty_prompt(acp_client) -> None:
 
 
 @pytest.mark.asyncio
-async def test_streaming_fidelity_chunk_concat_matches_full_response(
+async def test_assembled_response_matches_full_expected_text(
     acp_client,
 ) -> None:
+    """Server merges all streamed chunks into one notification before sending."""
     session_id = await acp_client.new_session()
     prompt_text = "Chunk this response carefully"
     result = await acp_client.prompt(session_id, prompt_text)
 
-    assert len(result.chunks) >= 2
-    assert "".join(result.chunks) == _expected_response(prompt_text, turn=1, call=1)
+    # Exactly one notification; its text equals the fully assembled response.
+    assert len(result.chunks) == 1
+    assert result.chunks[0] == _expected_response(prompt_text, turn=1, call=1)
 
 
 @pytest.mark.asyncio
