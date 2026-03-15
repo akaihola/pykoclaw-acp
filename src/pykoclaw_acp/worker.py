@@ -115,7 +115,10 @@ async def _run_worker() -> None:
 
     # Build the system prompt: base instruction + any plugin additions.
     _BASE_PROMPT = (
-        "If a tool call fails, retry it before concluding the tool is unavailable."
+        "If a tool call fails, retry it before concluding the tool is unavailable. "
+        "Do not use internal todo lists, plan mode, or other planning workflows. "
+        "Answer directly in a single pass unless the user explicitly asks for a "
+        "plan, checklist, or step-by-step planning."
     )
     system_prompt = (
         f"{_BASE_PROMPT}\n\n{config.system_prompt}"
