@@ -201,13 +201,11 @@ class WorkerPool:
         self, session_id: str, *, resume_session_id: str | None = None
     ) -> _WorkerHandle:
         conversation_name = f"acp-{session_id[:8]}"
-        conv_dir = self._data_dir / "conversations" / conversation_name
-        conv_dir.mkdir(parents=True, exist_ok=True)
 
         system_prompt = compose_system_prompt_additions(load_plugins())
 
         config = WorkerConfig(
-            cwd=str(conv_dir),
+            cwd=str(self._data_dir),
             model=settings.model,
             conversation_name=conversation_name,
             db_path=str(settings.db_path),

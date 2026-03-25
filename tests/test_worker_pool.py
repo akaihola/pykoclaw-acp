@@ -442,3 +442,108 @@ async def test_concurrent_sessions(tmp_path: Path, tmp_db: sqlite3.Connection) -
         assert len(names) == 3
     finally:
         await pool.close()
+
+
+# ---------------------------------------------------------------------------
+# cwd-to-data-dir: worker config.cwd must equal data_dir, not a
+# per-conversation subdirectory, and no conversations/ dir should be created.
+# ---------------------------------------------------------------------------
+
+
+def _cwd_echo_worker_script(tmp_path: Path) -> Path:
+    """Write a mock worker that echoes config.cwd as text reply."""
+    script = tmp_path / "cwd_echo_worker.py"
+    script.write_text(
+        dedent(
+            """\
+            import json
+            import sys
+
+            def write_msg(data):
+                sys.stdout.write(json.dumps(data) + "\\n")
+                sys.stdout.flush()
+
+            def main():
+                config_line = sys.stdin.readline()
+                if not config_line:
+                    return
+                config = json.loads(config_line)
+                cwd_value = config.get("cwd", "")
+
+                write_msg({"type": "ready"})
+
+                while True:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+                    msg = json.loads(line.strip())
+                    if msg.get("type") == "shutdown":
+                        break
+                    if msg.get("type") == "query":
+                        msg_id = msg["id"]
+                        # Echo the cwd back as text
+                        write_msg({"type": "text", "id": msg_id, "text": cwd_value})
+                        write_msg({"type": "result", "id": msg_id, "session_id": "cwd-sess"})
+
+            if __name__ == "__main__":
+                main()
+            """
+        )
+    )
+    return script
+
+
+@pytest.mark.asyncio
+async def test_worker_cwd_is_data_dir(
+    tmp_path: Path, tmp_db: sqlite3.Connection
+) -> None:
+    """WorkerConfig.cwd must equal data_dir, not conversations/{name}/."""
+    script = _cwd_echo_worker_script(tmp_path)
+    data_dir = tmp_path / "workspace"
+    data_dir.mkdir()
+    pool = WorkerPool(
+        db=tmp_db,
+        data_dir=data_dir,
+        worker_cmd=[sys.executable, str(script)],
+    )
+    await pool.start()
+
+    chunks: list[str] = []
+
+    async def on_text(text: str) -> None:
+        chunks.append(text)
+
+    try:
+        await pool.send("cwd-test-1", "check cwd", on_text=on_text)
+        assert chunks == [str(data_dir)], (
+            f"Expected cwd={data_dir}, got cwd={chunks!r}. "
+            "Worker should receive data_dir as cwd, not a conversations/ subdir."
+        )
+    finally:
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_spawn_worker_does_not_create_conversations_dir(
+    tmp_path: Path, tmp_db: sqlite3.Connection
+) -> None:
+    """_spawn_worker must NOT create data_dir/conversations/{name}/."""
+    script = _mock_worker_script(tmp_path)
+    data_dir = tmp_path / "workspace"
+    data_dir.mkdir()
+    pool = WorkerPool(
+        db=tmp_db,
+        data_dir=data_dir,
+        worker_cmd=[sys.executable, str(script)],
+    )
+    await pool.start()
+
+    try:
+        await pool.send("nodir-test", "hello")
+        conv_dir = data_dir / "conversations"
+        assert not conv_dir.exists(), (
+            f"Directory {conv_dir} should not be created. "
+            "_spawn_worker should not create per-conversation subdirectories."
+        )
+    finally:
+        await pool.close()
