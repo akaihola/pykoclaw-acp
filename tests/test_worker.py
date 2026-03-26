@@ -255,6 +255,133 @@ class TestHandleQuery:
 
 
 # ---------------------------------------------------------------------------
+# Tests for resume-connect fallback in _run_worker
+# ---------------------------------------------------------------------------
+
+
+class TestResumeConnectFallback:
+    """When client.connect() fails with a resume session ID, the worker
+    should fall back to a fresh (non-resume) session."""
+
+    @pytest.mark.asyncio
+    async def test_fallback_to_fresh_on_resume_failure(self, tmp_path: Path) -> None:
+        """Worker retries with resume=None when initial connect fails."""
+        from claude_agent_sdk._errors import ProcessError
+
+        db_path = tmp_path / "test.db"
+        from pykoclaw.db import init_db
+
+        init_db(db_path)
+
+        connect_calls: list[dict[str, Any]] = []
+
+        class MockSDKClient:
+            def __init__(self, options: Any) -> None:
+                self.options = options
+
+            async def connect(self) -> None:
+                connect_calls.append({"resume": self.options.resume})
+                if self.options.resume is not None:
+                    raise ProcessError("Command failed with exit code 1", exit_code=1)
+
+            async def disconnect(self) -> None:
+                pass
+
+            async def query(self, prompt: str) -> None:
+                pass
+
+            async def receive_response(self):  # noqa: ANN201
+                return
+                yield  # make it an async generator
+
+        import io
+
+        config = {
+            "type": "config",
+            "cwd": str(tmp_path),
+            "model": "test-model",
+            "conversation_name": "acp-resume-test",
+            "db_path": str(db_path),
+            "cli_path": None,
+            "allowed_tools": ["Bash"],
+            "resume_session_id": "stale-session-abc",
+            "system_prompt": "",
+        }
+        config_line = json.dumps(config) + "\n"
+
+        captured_stdout: list[str] = []
+
+        with (
+            patch("pykoclaw_acp.worker.ClaudeSDKClient", MockSDKClient),
+            patch("pykoclaw_acp.worker.make_mcp_server", return_value={}),
+            patch("sys.stdin", io.StringIO(config_line)),
+            patch(
+                "pykoclaw_acp.worker._write_msg",
+                side_effect=lambda msg: captured_stdout.append(msg),
+            ),
+        ):
+            from pykoclaw_acp.worker import _run_worker
+
+            # _run_worker reads stdin for config, then enters message loop.
+            # After connect succeeds (on fallback), it sends ReadyMessage
+            # then blocks on stdin. Since our StringIO stdin is exhausted,
+            # it will see EOF and return.
+            await _run_worker()
+
+        # First connect with resume, second connect without
+        assert len(connect_calls) == 2
+        assert connect_calls[0]["resume"] == "stale-session-abc"
+        assert connect_calls[1]["resume"] is None
+
+        # ReadyMessage was sent
+        ready_msgs = [m for m in captured_stdout if isinstance(m, ReadyMessage)]
+        assert len(ready_msgs) == 1
+
+    @pytest.mark.asyncio
+    async def test_no_fallback_when_fresh_connect_fails(self, tmp_path: Path) -> None:
+        """When resume is None and connect fails, the error propagates."""
+        from claude_agent_sdk._errors import ProcessError
+
+        db_path = tmp_path / "test.db"
+        from pykoclaw.db import init_db
+
+        init_db(db_path)
+
+        class FailingClient:
+            def __init__(self, options: Any) -> None:
+                self.options = options
+
+            async def connect(self) -> None:
+                raise ProcessError("Command failed with exit code 1", exit_code=1)
+
+        import io
+
+        config = {
+            "type": "config",
+            "cwd": str(tmp_path),
+            "model": "test-model",
+            "conversation_name": "acp-fresh-fail",
+            "db_path": str(db_path),
+            "cli_path": None,
+            "allowed_tools": ["Bash"],
+            "resume_session_id": None,
+            "system_prompt": "",
+        }
+        config_line = json.dumps(config) + "\n"
+
+        with (
+            patch("pykoclaw_acp.worker.ClaudeSDKClient", FailingClient),
+            patch("pykoclaw_acp.worker.make_mcp_server", return_value={}),
+            patch("sys.stdin", io.StringIO(config_line)),
+            patch("pykoclaw_acp.worker._write_msg"),
+        ):
+            from pykoclaw_acp.worker import _run_worker
+
+            with pytest.raises(ProcessError):
+                await _run_worker()
+
+
+# ---------------------------------------------------------------------------
 # End-to-end subprocess protocol test via mock worker script
 # ---------------------------------------------------------------------------
 

@@ -144,7 +144,37 @@ async def _run_worker() -> None:
     )
 
     client = ClaudeSDKClient(options)
-    await client.connect()
+    try:
+        await client.connect()
+    except Exception:
+        if config.resume_session_id:
+            log.warning(
+                "Resume connect failed for session %s, falling back to fresh",
+                config.resume_session_id,
+                exc_info=True,
+            )
+            # Rebuild options without resume
+            options = ClaudeAgentOptions(
+                cwd=config.cwd,
+                permission_mode="bypassPermissions",
+                mcp_servers={"pykoclaw": mcp_server},
+                model=config.model,
+                cli_path=config.cli_path,
+                allowed_tools=(
+                    list(config.allowed_tools)
+                    if config.allowed_tools
+                    else list(_ALLOWED_TOOLS)
+                ),
+                system_prompt=system_prompt,
+                setting_sources=["project"],
+                env={"SHELL": "/bin/bash"},
+                resume=None,
+                include_partial_messages=True,
+            )
+            client = ClaudeSDKClient(options)
+            await client.connect()
+        else:
+            raise
 
     _write_msg(ReadyMessage())
     log.info("Worker ready")
