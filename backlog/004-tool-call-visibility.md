@@ -1,17 +1,31 @@
-# Surface tool calls in Mitto
+# Surface tool calls and restore streaming in Mitto
 
 **Priority:** Medium
 **Status:** Backlog
 **Created:** 2026-02-26
-**Tags:** acp, mitto, tool-calls, ux
+**Updated:** 2026-03-22
+**Tags:** acp, mitto, tool-calls, streaming, ux
 
-## Problem
+## What the user experiences today (problems)
 
-Pykoclaw drops all tool call information on the floor. When the agent
-uses `Bash`, `Read`, `Edit`, `Grep`, etc., the user in Mitto sees only
-the text output with `---` separators between text runs. There is no
-visibility into *what* the agent is doing between text blocks — no tool
-names, no status indicators, no timing.
+### 1 — Responses appear all at once
+
+When the agent is working on a long answer, Mitto shows nothing until the
+entire response is ready. There is no progressive text — no sense that the
+agent is thinking or writing. The UI appears frozen, then everything appears
+at once.
+
+This used to work differently: responses arrived word-by-word as the agent
+generated them.
+
+### 2 — Tool activity is invisible
+
+While the agent reads files, runs commands, searches the codebase, or edits
+code, the user sees a blank wait followed by the final answer. There is no
+indication of what is happening, how long it will take, or whether anything
+is working at all.
+
+These two problems are independent and can be fixed separately.
 
 ## Why it matters
 
@@ -532,16 +546,341 @@ Phase 4 (server: slash cmd +       ← depends on Phase 3
 All phases are in `pykoclaw-acp` (one feature branch, zero Mitto
 changes).
 
+## Streaming restore plan (buffered semantic windows)
+
+### Confirmed diagnosis (2026-03-22)
+
+End-to-end pipeline traced independently in two sessions; both reached the
+same conclusion.
+
+**What works correctly today:**
+
+- `worker.py` — emits `TextChunkMessage` for every SDK partial immediately;
+  `include_partial_messages=True` is set.
+- `worker_pool.py` — `_query()` calls `await on_text(msg.text)` for each
+  `TextChunkMessage` as they arrive; no buffering here.
+- Mitto (`background_session.go`) — persists and broadcasts each
+  `agent_message` event immediately as it arrives.
+- Mitto (`stream_buffer.go`) — explicitly handles interleaved markdown,
+  thoughts, and tool calls with its own flush logic.
+- Mitto (`useWebSocket.js`) — appends/coalesces streaming `agent_message`
+  events; handles `tool_call`/`tool_update` separately.
+- The entire Mitto stack from `StreamBuffer` through WebSocket through frontend
+  state is designed for "text, tool, more text" interleaved patterns.
+
+**Where streaming is suppressed:**
+
+`server.py` — `_handle_session_prompt` collects every incoming chunk into
+`chunks: list[str]`, waits for `_pool.send()` to fully complete, then applies
+transforms and emits exactly **one** `session/update` with
+`agent_message_chunk`. This is the sole bottleneck.
+
+**Additional suppression:** tool calls and thoughts are not forwarded to Mitto
+at all — they are silently swallowed in `server.py`. This is a separate
+concern; text streaming restoration can land independently of tool call
+visibility.
+
+**Zero Mitto changes required for text streaming restoration.** Everything
+needed is already in place on the Mitto side.
+
+### Goal
+
+Restore incremental rendering for ACP responses in Mitto **without** going
+back to token-by-token raw streaming and **without** waiting for the full
+turn to finish. The server should forward transformed text in buffered
+windows that align with semantic boundaries, keeping an unsafe tail in
+memory until it becomes syntactically safe to rewrite and emit.
+
+### Why this approach
+
+Current ACP behavior accumulates the full response in `server.py`, applies
+plugin transforms once, and emits a single `agent_message_chunk` at the end.
+That preserves correctness for pykofinder link rewriting but removes the UX
+benefit of streaming.
+
+A buffered-window approach keeps the current transform contract
+(`transform_response(text, ctx) -> str`) while restoring responsiveness:
+
+- **Safer than token streaming**: incomplete markdown links, wikilinks, HTML
+  `<img>` tags, and code fences stay buffered until closed.
+- **Much better UX than whole-turn buffering**: prose can appear paragraph by
+  paragraph or line by line at natural boundaries.
+- **Smaller scope than a new plugin API**: initial implementation can live
+  entirely in `pykoclaw-acp/server.py` with no mandatory plugin interface
+  changes.
+
+### Current constraints to respect
+
+- `pykoclaw-acp` worker already produces partial text via
+  `include_partial_messages=True`.
+- `pykoclaw` plugin API currently supports only full-string transforms via
+  `compose_transformers(load_plugins(), ctx)`.
+- `pykofinder` transforms are regex-based and assume complete local syntax
+  units (`[[wikilinks]]`, `[label](target)`, `![alt](target)`, `<img ...>`).
+- Mitto already supports incremental `agent_message_chunk` events.
+
+### Proposed design
+
+#### 1. Replace whole-turn accumulation with a stream window accumulator
+
+In `server.py`, replace the current pattern:
+
+- accumulate all chunks in `chunks: list[str]`
+- `full_text = "".join(chunks)`
+- transform once
+- emit once
+
+with a persistent per-turn buffer:
+
+- `raw_buffer: str` — all un-emitted raw text received so far
+- optional bookkeeping for diagnostics:
+  - `emitted_chars: int`
+  - `flush_count: int`
+
+On every incoming worker text chunk:
+
+1. append chunk to `raw_buffer`
+2. compute the largest **safe flush prefix**
+3. transform only that prefix
+4. emit exactly that transformed prefix as one ACP `agent_message_chunk`
+5. remove the emitted raw prefix from `raw_buffer`
+
+At end of turn:
+
+1. transform and emit any remaining buffered tail
+2. send the normal `stopReason: end_turn` response
+
+#### 2. Define “safe flush prefix” heuristics
+
+The flush algorithm should be conservative. If uncertain, keep more text in
+buffer rather than risking malformed rewrites.
+
+Start with these rules:
+
+**Safe positive boundaries**
+- flush after a blank line (`\n\n`) — paragraph boundary
+- flush after a normal line ending when not inside an incomplete structure
+- flush after a completed wikilink `]]`
+- flush after a completed markdown link/image closing `)`
+- flush after a completed HTML tag closing `>`
+- flush after a horizontal-rule separator block if it is complete
+
+**Unsafe tails to keep buffered**
+- unmatched `[[`
+- unmatched markdown link opener patterns like `[` / `](` without closing `)`
+- incomplete image syntax `![...` / `![...](...`
+- incomplete HTML `<img ...` tag without closing `>`
+- unmatched inline backtick runs
+- unclosed triple-backtick fences
+- trailing partial pathish fragments immediately after `(` or `[[` where the
+  next chunk may complete the reference
+
+#### 3. Handle fenced code blocks explicitly
+
+Code fences are the easiest place to corrupt content if we flush too early.
+The accumulator should track whether the current tail is inside an unclosed
+triple-backtick fence.
+
+While inside an open code fence:
+- do **not** flush on normal line boundaries
+- only flush once the matching closing fence arrives
+- then treat the whole fenced block as a safe unit
+
+This keeps markdown rendering stable and avoids path-rewriting inside partial
+code-fence fragments.
+
+#### 4. Keep transforms stateless for v1
+
+Do **not** introduce a new streaming plugin protocol initially.
+
+Instead:
+- compute the safe prefix in ACP server code
+- call the existing composed full-string transformer only on that prefix
+- emit the transformed result immediately
+
+This works as long as the chosen prefix is syntactically closed enough for the
+existing regex-based transforms.
+
+#### 5. End-of-turn final flush remains authoritative
+
+Even with streaming restored, the end-of-turn path should still:
+- flush all remaining buffered raw text
+- run the same transform pipeline on the final remainder
+- emit it before `end_turn`
+
+This guarantees no text is stranded in the buffer and preserves exact final
+content delivery.
+
+### Suggested implementation phases
+
+#### Phase A — Add flush-window helper in ACP server
+
+Create a small helper in `pykoclaw-acp` (either local to `server.py` or a new
+module such as `stream_window.py`) that exposes something like:
+
+```python
+safe_prefix, tail = split_safe_flush_prefix(raw_buffer)
+```
+
+Responsibilities:
+- inspect the current accumulated raw text
+- identify the largest prefix that is safe to transform now
+- leave a tail containing any incomplete syntax structures
+
+Keep it pure and side-effect free so it is easy to unit test.
+
+#### Phase B — Integrate helper into `_handle_session_prompt`
+
+Change `_collect_chunk()` logic in `server.py` so each incoming SDK partial:
+- appends into `raw_buffer`
+- repeatedly flushes while a non-empty safe prefix is available
+- writes each flushed transformed prefix as `agent_message_chunk`
+
+The current whole-turn `chunks: list[str]` logic should be removed once this is
+in place.
+
+#### Phase C — Preserve compatibility with current transforms
+
+Reuse existing:
+- `TransformContext(channel_prefix="acp", native_file_extensions=frozenset())`
+- `compose_transformers(load_plugins(), ctx)`
+
+Do not change plugin registration order or semantics in this phase.
+
+#### Phase D — Add diagnostics for real-world tuning
+
+Add debug logging behind the existing logger to record:
+- raw chunk size received
+- safe prefix size emitted
+- tail size retained
+- whether flush was blocked by open wikilink, markdown link, HTML tag, or code fence
+
+This will help tune heuristics after staging without changing wire behavior.
+
+### Edge cases to design for
+
+#### Incomplete markdown links across chunk boundaries
+
+Example:
+- chunk 1: `[Project](`
+- chunk 2: `pages/Projects/Foo.md)`
+
+Desired behavior:
+- chunk 1 stays buffered
+- after chunk 2 arrives, full link becomes safe
+- transformed link emits once
+
+#### Incomplete wikilinks across chunk boundaries
+
+Example:
+- chunk 1: `See [[Agent `
+- chunk 2: `Commons]] for details`
+
+Desired behavior:
+- no partial emit after chunk 1 if the tail contains unmatched `[[`
+- emit once `]]` arrives
+
+#### HTML image tags split across chunks
+
+Example:
+- chunk 1: `<img src="journals/media/foo`
+- chunk 2: `.png" alt="Foo">`
+
+Desired behavior:
+- keep entire tag buffered until `>`
+- then normalise/transform once complete
+
+#### Long prose without special syntax
+
+Example:
+- model emits normal paragraphs linearly
+
+Desired behavior:
+- flush at paragraph boundaries quickly
+- avoid waiting for full turn
+
+#### Code blocks containing markdown-like syntax
+
+Example:
+- fenced code contains `[[not a real wikilink]]`
+
+Desired behavior:
+- do not attempt partial semantic parsing inside an open code fence
+- flush only once the fence closes
+
+### Testing plan
+
+#### Unit tests for safe-prefix splitting
+
+Add focused tests for the helper with inputs such as:
+- plain prose with paragraph breaks
+- incomplete and complete markdown links
+- incomplete and complete wikilinks
+- incomplete and complete HTML `<img>` tags
+- inline backticks
+- fenced code blocks
+- multiple flushable segments plus one unsafe tail
+
+Each test should assert the exact returned `(safe_prefix, tail)`.
+
+#### ACP server tests
+
+Update/add tests in `tests/test_server.py` to verify:
+- server emits multiple `agent_message_chunk` notifications during a turn when
+  the mock worker yields multiple partials that cross safe boundaries
+- server does **not** emit malformed partial links/tags
+- server still emits final remainder before `end_turn`
+- pool error path still emits `error` + `end_turn`
+
+#### Integration tests
+
+Revise `tests/test_integration.py` so ACP no longer enforces “exactly one
+chunk per turn”. Instead assert:
+- concatenated emitted chunks equal the final expected text
+- chunk count is `>= 1`
+- specific fixture prompts produce more than one chunk when they contain
+  paragraph boundaries
+
+### Rollout strategy
+
+1. Implement helper + unit tests first
+2. Integrate into ACP server with debug logging
+3. Update ACP server/integration tests
+4. Verify in staging against Mitto with a real pykoclaw-acp conversation
+5. Tune flush heuristics based on actual streamed output patterns
+
+### Risks and mitigations
+
+| Risk | Likelihood | Impact | Mitigation |
+|------|-----------|--------|------------|
+| Heuristics flush too early and break rewritten links | Medium | High | Start conservative; keep unsafe tail larger; cover syntax-boundary tests thoroughly |
+| Heuristics flush too late and UX still feels non-streaming | Medium | Medium | Add debug logging and tune around paragraph boundaries first |
+| Regex transforms behave unexpectedly on locally complete but globally odd text | Low | Medium | Treat end-of-turn flush as final correctness backstop; stage with real prompts |
+| Code-fence detection misses edge cases | Medium | Medium | Keep v1 handling simple and conservative; add explicit fence tests |
+| Integration tests remain too coupled to chunk counts | Medium | Low | Assert concatenated text equality, not exact chunk count, except in targeted streaming tests |
+
+### Open questions
+
+1. Should a single newline in plain prose be enough to flush, or should v1
+   only flush on blank lines and explicit completed constructs?
+2. Do we want a maximum tail size / timeout safety valve so long unbroken prose
+   still emits periodically even without paragraph breaks?
+3. Should debug logging be temporary, or kept permanently at debug level for
+   future streaming regressions?
+4. Is there any plugin besides pykofinder that relies on full-turn context in a
+   way that would invalidate safe-prefix transforms?
+
 ## Definition of done
 
-- [ ] `PreToolUse` / `PostToolUse` / `PostToolUseFailure` hooks
-      registered in worker
-- [ ] Tool events flow through worker → pool → server → ACP client
-- [ ] `/tools` slash command toggles visibility per session
-- [ ] Tool call badges visible in Mitto when enabled (using existing
-      Mitto rendering — no Mitto changes)
-- [ ] `---` separators suppressed when tool calls are visible
-- [ ] Tool notifications suppressed when tool calls are hidden
-      (default)
-- [ ] All new code has unit tests
-- [ ] Staging verification with real agent interaction
+- [ ] ACP no longer buffers the full turn before emitting text
+- [ ] Incremental `agent_message_chunk` notifications resume in Mitto
+- [ ] Incomplete markdown links, wikilinks, HTML image tags, and code fences do
+      not leak as malformed partial output
+- [ ] Existing plugin transform contract remains unchanged for v1
+- [ ] Unit tests cover safe-prefix boundary detection
+- [ ] ACP server tests cover multi-chunk emission and final tail flush
+- [ ] Integration tests validate concatenated output equality rather than
+      single-chunk semantics
+- [ ] Staging verification confirms visibly incremental rendering in Mitto
+- [ ] Tool-call visibility plan in this backlog item remains compatible with the
+      restored streaming pipeline

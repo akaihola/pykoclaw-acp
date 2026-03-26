@@ -13,13 +13,14 @@ pykoclaw-messaging = { workspace = true }
 acp = "pykoclaw_acp:AcpPlugin"
 
 [dependency-groups]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "playwright==1.57.0"]
 
 [tool.pytest.ini_options]
 markers = [
     "e2e: end-to-end tests requiring a running Claude API (deselected by default)",
+    "browser: browser smoke tests requiring a running Mitto UI (deselected by default)",
 ]
-addopts = "-m 'not e2e'"
+addopts = "-m 'not e2e and not browser'"
 asyncio_mode = "auto"
 
 [build-system]
